@@ -460,6 +460,7 @@ function updateFormInputs(m) {
     setValue("triggerKeywordsInput", m.trigger_keywords || "");
 
     setValue("columnInput", m.layout_columns || 3);
+    setValue("rowHeightInput", m.item_height || '');
     setValue("cvsW", m.canvas_width || 1000);
     setValue("cvsH", m.canvas_height || 2000);
     if (document.getElementById("canvasMode")) document.getElementById("canvasMode").value = m.use_canvas_size ? "true" : "false";
@@ -542,7 +543,7 @@ function updateFormInputs(m) {
 
 function updateMenuMeta(key, val) {
     const m = getCurrentMenu();
-    if (['layout_columns', 'canvas_width', 'canvas_height', 'group_blur_radius', 'item_blur_radius', 'group_bg_alpha', 'item_bg_alpha', 'shadow_offset_x', 'shadow_offset_y', 'shadow_radius', 'bg_custom_width', 'bg_custom_height', 'group_custom_width', 'group_custom_height', 'item_custom_width', 'item_custom_height', 'video_fps'].includes(key)) {
+    if (['layout_columns', 'item_height', 'canvas_width', 'canvas_height', 'group_blur_radius', 'item_blur_radius', 'group_bg_alpha', 'item_bg_alpha', 'shadow_offset_x', 'shadow_offset_y', 'shadow_radius', 'bg_custom_width', 'bg_custom_height', 'group_custom_width', 'group_custom_height', 'item_custom_width', 'item_custom_height', 'video_fps'].includes(key)) {
         m[key] = parseInt(val);
     } else if (key === 'use_canvas_size' || key === 'shadow_enabled') {
         m[key] = val === 'true' || val === true;
@@ -597,6 +598,91 @@ function toggleBgPanel() {
         vidPanel.style.display = "none";
     }
     renderCanvas(getCurrentMenu());
+}
+
+// =============================================================
+//  网格排布：支持半高功能项
+//  规则与后端 renderer/menu.py 的 grid_slots 完全一致，改一边必须同步改另一边，
+//  否则编辑器画布和实际出图会对不上。
+// =============================================================
+
+const GRID_GAP = 15;
+const DEFAULT_ROW_H = 90;
+// 前端拿不到字体真实度量，按内置字体实测（行高约为字号的 1.35 倍）估算
+const LINE_H_RATIO = 1.36;
+
+// 按顺序逐格排布；连续两个半高项叠进同一格（一上一下），
+// 半高项后面紧跟整高项时，这一格的下半留空
+function gridSlots(items, columns) {
+    const cols = Math.max(1, parseInt(columns) || 1);
+    const slots = [];
+    let row = 0, col = 0, topTaken = false;
+    const advance = () => {
+        topTaken = false;
+        if (++col >= cols) { col = 0; row++; }
+    };
+    (items || []).forEach(item => {
+        if (item && item.half) {
+            if (topTaken) { slots.push({ row, col, part: 'bottom' }); advance(); }
+            else { slots.push({ row, col, part: 'top' }); topTaken = true; }
+        } else {
+            if (topTaken) advance();
+            slots.push({ row, col, part: 'full' });
+            advance();
+        }
+    });
+    // 下一个空位：当前格上半被占了就是它的下半，否则是一个整格
+    return { slots, next: { row, col, part: topTaken ? 'bottom' : 'full' } };
+}
+
+// 每个网格行拆成两条半高轨道：整高项跨两条，半高项占一条
+function gridPlacementCSS(slot) {
+    const start = slot.row * 2 + (slot.part === 'bottom' ? 2 : 1);
+    const span = slot.part === 'full' ? 2 : 1;
+    return `grid-column:${slot.col + 1};grid-row:${start} / span ${span};`;
+}
+
+// 与后端 clamp_lines 同一思路：估算格子能放几行，描述放不下就整段不显示
+function itemTextFit(boxH, nameSz, descSz, hasDesc) {
+    const spacing = 4, gap = 5;
+    const nameLineH = nameSz * LINE_H_RATIO;
+    const descLineH = descSz * LINE_H_RATIO;
+    const nameLines = Math.max(1, Math.floor((boxH + spacing) / (nameLineH + spacing)));
+    let descLines = 0;
+    if (hasDesc) {
+        const avail = boxH - nameLineH - gap;
+        descLines = avail > 0 ? Math.floor((avail + spacing) / (descLineH + spacing)) : 0;
+    }
+    return { nameLines, descLines };
+}
+
+function lineClampCSS(lines) {
+    return `display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:${lines};overflow:hidden;`;
+}
+
+// 用出图时同一套 Pillow 渲染出真实效果 —— 画布毕竟是 CSS 近似
+async function previewReal() {
+    const modal = document.getElementById('realPreviewModal');
+    const img = document.getElementById('realPreviewImg');
+    const status = document.getElementById('realPreviewStatus');
+    const menu = getCurrentMenu();
+    img.removeAttribute('src');
+    status.innerText = '⏳ 正在渲染...';
+    modal.style.display = 'flex';
+    try {
+        const sdk = await bridge();
+        const res = await sdk.apiPost('preview', menu);
+        if (img.dataset.url) URL.revokeObjectURL(img.dataset.url);
+        img.dataset.url = b64ToBlobUrl(res.b64, res.mime);
+        img.src = img.dataset.url;
+        status.innerText = menu.bg_type === 'video' ? '动态背景菜单这里只预览静态排版' : '';
+    } catch (e) {
+        status.innerText = '❌ 渲染失败：' + (e && e.message ? e.message : e);
+    }
+}
+
+function closeRealPreview() {
+    document.getElementById('realPreviewModal').style.display = 'none';
 }
 
 function renderCanvas(m) {
@@ -778,7 +864,11 @@ function renderCanvas(m) {
             contentHeight = Math.max(Number(g.min_height) || 100, maxBottom + 20) + "px";
         }
 
-        const gridStyle = (freeMode && !isTextGroup) ? '' : `display:grid; gap:15px; padding:20px; grid-template-columns: repeat(${g.layout_columns || m.layout_columns || 3}, 1fr);`;
+        const gridCols = parseInt(g.layout_columns || m.layout_columns) || 3;
+        const rowH = parseInt(g.item_height || m.item_height) || DEFAULT_ROW_H;
+        const halfTrack = Math.max(1, (rowH - GRID_GAP) / 2);
+        const gridLayout = gridSlots(g.items, gridCols);
+        const gridStyle = (freeMode && !isTextGroup) ? '' : `display:grid; gap:${GRID_GAP}px; padding:20px; grid-template-columns: repeat(${gridCols}, 1fr); grid-auto-rows:${halfTrack}px;`;
 
         const gTitleSz = getStyle(g, 'title_size', 'group_title_size') || 30;
         const gTitleFont = cssFont(getStyle(g, 'title_font', 'group_title_font'));
@@ -882,20 +972,24 @@ function renderCanvas(m) {
                     iDescShadowCss = `${iDescShadowX}px ${iDescShadowY}px ${iDescShadowR}px ${iDescShadowColor}`;
                 }
                 
-                // 处理功能项自定义大小
-                let itemStyles = "";
-                if (item.custom_width !== undefined || item.custom_height !== undefined) {
-                    const itemW = item.custom_width || 'auto';
-                    const itemH = item.custom_height || 'auto';
-                    itemStyles = `width:${itemW}px;height:${itemH}px;`;
-                } else {
-                    itemStyles = `height:90px;`;
-                }
+                // 网格模式按格子定位，高度交给网格轨道；自定义大小仍然优先
+                const slot = gridLayout.slots[iIdx];
+                let itemStyles = freeMode ? '' : gridPlacementCSS(slot);
+                if (item.custom_width !== undefined) itemStyles += `width:${item.custom_width}px;`;
+                if (item.custom_height !== undefined) itemStyles += `height:${item.custom_height}px;`;
+
+                let boxH = slot.part === 'full' ? rowH : halfTrack;
+                if (freeMode) boxH = parseInt(item.h) || 100;
+                else if (item.custom_height !== undefined) boxH = item.custom_height;
+                const fit = itemTextFit(boxH, iNameSz, iDescSz, !!item.desc);
+                const descHtml = fit.descLines > 0
+                    ? `<div style="color:${getStyle(item, 'desc_color', 'item_desc_color')};font-family:'${iDescFont}';font-size:${iDescSz}px;margin-top:5px;white-space:pre-wrap;text-shadow:${iDescShadowCss};${getTextStyleCSS(item, 'item_desc')}${lineClampCSS(fit.descLines)}">${item.desc}</div>`
+                    : '';
 
                 const txt = `
                     <div class="item-text-content" style="text-shadow:${shadowCss};">
-                        <div style="color:${getStyle(item, 'name_color', 'item_name_color')};font-family:'${iNameFont}';font-size:${iNameSz}px;text-shadow:${iNameShadowCss};${getTextStyleCSS(item, 'item_name')}">${item.name}</div>
-                        <div style="color:${getStyle(item, 'desc_color', 'item_desc_color')};font-family:'${iDescFont}';font-size:${iDescSz}px;margin-top:5px;white-space:pre-wrap;text-shadow:${iDescShadowCss};${getTextStyleCSS(item, 'item_desc')}">${item.desc || ''}</div>
+                        <div style="color:${getStyle(item, 'name_color', 'item_name_color')};font-family:'${iNameFont}';font-size:${iNameSz}px;text-shadow:${iNameShadowCss};${getTextStyleCSS(item, 'item_name')}${lineClampCSS(fit.nameLines)}">${item.name}</div>
+                        ${descHtml}
                     </div>`;
 
                 if (freeMode) {
@@ -907,7 +1001,10 @@ function renderCanvas(m) {
             });
 
             if (!freeMode) {
-                html += `<div class="grid-item add-item-btn" onclick="addItem(${gIdx})"><span>+</span></div>`;
+                // 加号占下一个空位：上一个半高项下面还空着，就放进那个下半格，点了直接补一个半高项
+                const next = gridLayout.next;
+                const addHalf = next.part === 'bottom';
+                html += `<div class="grid-item add-item-btn" style="${gridPlacementCSS(next)}" title="${addHalf ? '在这个下半格添加半高项' : '添加功能项'}" onclick="addItem(${gIdx}, ${addHalf})"><span>+</span></div>`;
             }
             html += `</div>`;
         }
@@ -1007,7 +1104,7 @@ function renderSidebarGroupList(m) {
     });
 }
 
-function addItem(gIdx) {
+function addItem(gIdx, half) {
     const g = getCurrentMenu().groups[gIdx];
     let nextY = 20;
     if (g.free_mode) {
@@ -1018,7 +1115,9 @@ function addItem(gIdx) {
         });
         if (max > 0) nextY = max + 15;
     }
-    g.items.push({ name: "新功能", desc: "...", icon: "", x: 20, y: nextY, w: 200, h: 80 });
+    const item = { name: "新功能", desc: "...", icon: "", x: 20, y: nextY, w: 200, h: 80 };
+    if (half) item.half = true;
+    g.items.push(item);
     renderAll();
 }
 
@@ -1111,7 +1210,7 @@ function updateProp(type, gIdx, iIdx, key, val) {
     if (val === "") {
         delete obj[key];
     } else {
-        if (['title_size', 'sub_size', 'name_size', 'desc_size', 'text_size', 'bg_alpha', 'layout_columns', 'width', 'height', 'x', 'y', 'w', 'h', 'group_blur_radius', 'item_blur_radius', 'canvas_width', 'canvas_height', 'icon_size', 'bg_custom_width', 'bg_custom_height', 'blur_radius', 'custom_width', 'custom_height', 'title_shadow_offset_x', 'title_shadow_offset_y', 'title_shadow_radius', 'subtitle_shadow_offset_x', 'subtitle_shadow_offset_y', 'subtitle_shadow_radius', 'group_title_shadow_offset_x', 'group_title_shadow_offset_y', 'group_title_shadow_radius', 'group_sub_shadow_offset_x', 'group_sub_shadow_offset_y', 'group_sub_shadow_radius', 'item_name_shadow_offset_x', 'item_name_shadow_offset_y', 'item_name_shadow_radius', 'item_desc_shadow_offset_x', 'item_desc_shadow_offset_y', 'item_desc_shadow_radius', 'text_shadow_offset_x', 'text_shadow_offset_y', 'text_shadow_radius', 'text_bg_alpha', 'text_bg_blur'].includes(key)) {
+        if (['title_size', 'sub_size', 'name_size', 'desc_size', 'text_size', 'bg_alpha', 'layout_columns', 'item_height', 'width', 'height', 'x', 'y', 'w', 'h', 'group_blur_radius', 'item_blur_radius', 'canvas_width', 'canvas_height', 'icon_size', 'bg_custom_width', 'bg_custom_height', 'blur_radius', 'custom_width', 'custom_height', 'title_shadow_offset_x', 'title_shadow_offset_y', 'title_shadow_radius', 'subtitle_shadow_offset_x', 'subtitle_shadow_offset_y', 'subtitle_shadow_radius', 'group_title_shadow_offset_x', 'group_title_shadow_offset_y', 'group_title_shadow_radius', 'group_sub_shadow_offset_x', 'group_sub_shadow_offset_y', 'group_sub_shadow_radius', 'item_name_shadow_offset_x', 'item_name_shadow_offset_y', 'item_name_shadow_radius', 'item_desc_shadow_offset_x', 'item_desc_shadow_offset_y', 'item_desc_shadow_radius', 'text_shadow_offset_x', 'text_shadow_offset_y', 'text_shadow_radius', 'text_bg_alpha', 'text_bg_blur'].includes(key)) {
             val = parseInt(val);
         }
         if (key.endsWith('_enabled') || key.endsWith('_bold') || key.endsWith('_italic') || key.endsWith('_underline')) {
@@ -1501,6 +1600,7 @@ function generatePropForm(type, obj, gIdx, iIdx) {
         </div>`;
 
         html += input("每行列数 (Grid模式)", "layout_columns", obj.layout_columns, "number", "placeholder='默认跟随全局'");
+        html += input("行高 (px, Grid模式)", "item_height", obj.item_height, "number", "placeholder='默认跟随全局'");
         
         // 分组类型选择
         const isTextGroup = obj.group_type === 'text';
@@ -1600,6 +1700,13 @@ function generatePropForm(type, obj, gIdx, iIdx) {
             html += `<div class="form-row" style="display:flex;gap:5px;">
                 <button class="btn btn-secondary" ${!canMoveUp ? 'disabled' : ''} onclick="moveItem(${gIdx}, ${iIdx}, -1)">⬆ 前进一位</button>
                 <button class="btn btn-secondary" ${!canMoveDown ? 'disabled' : ''} onclick="moveItem(${gIdx}, ${iIdx}, 1)">⬇ 后退一位</button>
+            </div>`;
+            html += `<div class="form-row">
+                <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin:0;">
+                    <input type="checkbox" ${obj.half ? 'checked' : ''} onchange="updateProp('item', ${gIdx}, ${iIdx}, 'half', this.checked || '')" style="width:18px;height:18px;">
+                    半高（占半行，相邻两个半高项上下叠在同一格）
+                </label>
+                <div style="font-size:11px;color:#888;margin-top:4px;">默认行高 90 时半高格只放得下一行名称；想同时显示描述，把分组或全局的行高调到 140 左右。</div>
             </div>`;
         }
 

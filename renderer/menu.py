@@ -202,6 +202,36 @@ def block_height(text: str, font, spacing: int = 0) -> int:
     return lines * line_height(font) + (lines - 1) * spacing
 
 
+def _ellipsize(line: str, font, max_w: int, draw) -> str:
+    ell = "…"
+    if max_w <= 0:
+        return line + ell
+    while line and _text_width(draw, line + ell, font) > max_w:
+        line = line[:-1]
+    return line.rstrip() + ell
+
+
+def clamp_lines(text: str, font, spacing: int, max_h: int, max_w: int, draw, keep_one: bool = False) -> str:
+    """把多行文字裁到 max_h 以内，截掉了就在最后一行补省略号。
+
+    keep_one=True 时至少留一行：名称宁可略微出格，也不能整个消失。
+    """
+    if not text:
+        return text
+    lines = text.split("\n")
+    line_h = line_height(font)
+    fit = int((max_h + spacing) // (line_h + spacing)) if max_h > 0 else 0
+    if keep_one:
+        fit = max(1, fit)
+    if fit >= len(lines):
+        return text
+    if fit <= 0:
+        return ""
+    kept = lines[:fit]
+    kept[-1] = _ellipsize(kept[-1], font, max_w, draw)
+    return "\n".join(kept)
+
+
 def wrap_text_to_width(text: str, font, max_width: int, draw) -> str:
     """按宽度折行。
 
@@ -258,6 +288,7 @@ def render_item_content(overlay_img, draw, item, box, fonts_map, shadow_cfg, men
                     custom_icon_size = item.get("icon_size")
                     target_h = int(int(custom_icon_size) * scale) if custom_icon_size and int(
                         custom_icon_size) > 0 else int(h * 0.6)
+                    target_h = max(1, min(target_h, h - int(4 * scale)))
                     aspect_ratio = icon_img.width / icon_img.height if icon_img.height > 0 else 1
                     target_w = int(target_h * aspect_ratio)
                     icon_resized = icon_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
@@ -278,10 +309,14 @@ def render_item_content(overlay_img, draw, item, box, fonts_map, shadow_cfg, men
         if desc:
             desc = wrap_text_to_width(desc, desc_font, text_max_width, draw)
 
+    # 格子放不下时逐级让步：先削减描述行数，不够就去掉描述，最后才削减名称。
+    # 半高项在默认字号下通常只放得下一行名称，就靠这里收拾。
+    gap = int(5 * scale)
+    name = clamp_lines(name, name_font, line_spacing, h, text_max_width, draw, keep_one=True)
     name_h = block_height(name, name_font, line_spacing)
+    desc = clamp_lines(desc, desc_font, line_spacing, h - name_h - gap, text_max_width, draw)
     desc_h = block_height(desc, desc_font, line_spacing)
 
-    gap = int(5 * scale)
     total_text_height = name_h + (desc_h + gap if desc else 0)
     text_start_y = y + (h - total_text_height) / 2
     
@@ -385,6 +420,63 @@ def _calculate_bg_layout(src_w: int, src_h: int, canvas_w: int, canvas_h: int,
     return final_w, final_h, px, py
 
 
+def grid_slots(items: list, columns) -> Tuple[list, int]:
+    """算出网格模式下每个功能项落在哪一格。
+
+    按顺序逐格排布；标了 half 的是半高项，连续两个半高项会叠进同一格，一上一下。
+    半高项后面紧跟整高项时，这一格的下半留空，整高项挪到下一格。
+
+    返回 ([(row, col, part), ...], 总行数)，part 为 "full" / "top" / "bottom"。
+    前端 editor.js 的 gridSlots 必须和这里保持同一套规则，否则预览和出图对不上。
+    """
+    columns = max(1, int(columns or 1))
+    slots = []
+    row = col = 0
+    top_taken = False  # 当前格的上半已经被一个半高项占了
+
+    def advance():
+        nonlocal row, col, top_taken
+        top_taken = False
+        col += 1
+        if col >= columns:
+            col = 0
+            row += 1
+
+    for item in items:
+        if item.get("half"):
+            if top_taken:
+                slots.append((row, col, "bottom"))
+                advance()
+            else:
+                slots.append((row, col, "top"))
+                top_taken = True
+        else:
+            if top_taken:
+                advance()
+            slots.append((row, col, "full"))
+            advance()
+
+    rows = row + (1 if col > 0 or top_taken else 0)
+    return slots, rows
+
+
+def grid_item_box(slot, origin_x: int, origin_y: int, cell_w: int, row_h: int,
+                  gap_x: int, gap_y: int) -> Tuple[int, int, int, int]:
+    """把 grid_slots 给出的格子换算成 (x, y, w, h)。
+
+    两个半高项之间留 gap_y 的缝，下半项的底边与同一行整高项对齐。
+    """
+    row, col, part = slot
+    x = origin_x + col * (cell_w + gap_x)
+    y = origin_y + row * (row_h + gap_y)
+    if part == "full":
+        return x, y, cell_w, row_h
+    half_h = max(1, (row_h - gap_y) // 2)
+    if part == "bottom":
+        y += row_h - half_h
+    return x, y, cell_w, half_h
+
+
 def _render_layout(menu_data: dict, is_video_mode: bool) -> Image.Image:
     scale = float(menu_data.get("export_scale", 1.0))
     if scale <= 0: scale = 1.0
@@ -394,7 +486,7 @@ def _render_layout(menu_data: dict, is_video_mode: bool) -> Image.Image:
 
     PADDING_X = s(BASE_PADDING_X)
     GROUP_GAP = s(BASE_GROUP_GAP)
-    ITEM_H, ITEM_GAP_X, ITEM_GAP_Y = s(BASE_ITEM_H), s(BASE_ITEM_GAP_X), s(BASE_ITEM_GAP_Y)
+    ITEM_GAP_X, ITEM_GAP_Y = s(BASE_ITEM_GAP_X), s(BASE_ITEM_GAP_Y)
     TITLE_TOP_MARGIN = s(80)
 
     use_canvas_size = menu_data.get("use_canvas_size", False)
@@ -422,6 +514,9 @@ def _render_layout(menu_data: dict, is_video_mode: bool) -> Image.Image:
         is_free = group.get("free_mode", False)
         is_text_group = group.get("group_type") == "text"
         items, g_cols = group.get("items", []), group.get("layout_columns") or columns
+        # 行高：分组设置优先，其次全局，最后默认 90
+        row_h = s(int(group.get("item_height") or menu_data.get("item_height") or BASE_ITEM_H))
+        slots = []
         g_title_size = s(int(get_style(group, menu_data, 'title_size', 'group_title_size', 30)))
         
         # 优化：如果分组没有标题，减少留白
@@ -447,13 +542,14 @@ def _render_layout(menu_data: dict, is_video_mode: bool) -> Image.Image:
             max_bottom = max((s(int(item.get("y", 0))) + s(int(item.get("h", 100))) for item in items), default=0)
             content_h = max(s(int(group.get("min_height", 100))), max_bottom + s(20))
         elif items:
-            rows = (len(items) + g_cols - 1) // g_cols
-            content_h = rows * ITEM_H + (rows - 1) * ITEM_GAP_Y + s(30)
+            slots, rows = grid_slots(items, g_cols)
+            content_h = rows * row_h + (rows - 1) * ITEM_GAP_Y + s(30)
         else:
             content_h = s(50)
         group_layout_info.append({"data": group, "title_y": current_y,
                                   "box_rect": (PADDING_X, box_start_y, final_w - PADDING_X, box_start_y + content_h),
-                                  "is_free": is_free, "is_text_group": is_text_group, "columns": g_cols})
+                                  "is_free": is_free, "is_text_group": is_text_group, "columns": g_cols,
+                                  "slots": slots, "row_h": row_h})
         current_y = box_start_y + content_h + GROUP_GAP
 
     content_final_h = current_y + s(50)
@@ -648,15 +744,15 @@ def _render_layout(menu_data: dict, is_video_mode: bool) -> Image.Image:
                                       hex_to_rgb(get_style(grp, menu_data, 'sub_color', 'group_sub_color', '#AAAAAA')),
                                       group_sub_shadow, scale=scale, text_styles=group_sub_styles)
 
-            item_grid_w = (bw - s(40) - (g_info["columns"] - 1) * ITEM_GAP_X) // g_info["columns"]
+            g_cols = max(1, int(g_info["columns"]))
+            item_grid_w = (bw - s(40) - (g_cols - 1) * ITEM_GAP_X) // g_cols
             for i, item in enumerate(grp.get("items", [])):
                 if g_info["is_free"]:
                     ix, iy, iw, ih = bx + s(int(item.get("x", 0))), by + s(int(item.get("y", 0))), s(
                         int(item.get("w", 100))), s(int(item.get("h", 100)))
                 else:
-                    r, c = i // g_info["columns"], i % g_info["columns"]
-                    ix, iy, iw, ih = bx + s(20) + c * (item_grid_w + ITEM_GAP_X), by + s(20) + r * (
-                            ITEM_H + ITEM_GAP_Y), item_grid_w, ITEM_H
+                    ix, iy, iw, ih = grid_item_box(g_info["slots"][i], bx + s(20), by + s(20),
+                                                   item_grid_w, g_info["row_h"], ITEM_GAP_X, ITEM_GAP_Y)
                 
                 # 处理功能项自定义大小
                 item_custom_w = item.get("custom_width") or menu_data.get("item_custom_width")

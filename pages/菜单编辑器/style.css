@@ -267,7 +267,23 @@ input[type="color"] {
     overflow: hidden;
     text-align: left;
 }
-.grid-item { cursor: pointer; }
+.grid-item {
+    cursor: pointer;
+    /* 网格模式下格子高度由网格轨道决定（半高项只有半行高），不能再被 min-height 撑开；
+       上下不留内边距，和出图时的文字排布保持一致 */
+    min-height: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+}
+.item-icon { max-height: 100%; }
+
+.real-preview-btn {
+    position: fixed;
+    top: 12px;
+    right: 16px;
+    z-index: 50;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.5);
+}
 .grid-item:hover {
     transform: translateY(-2px);
     border-color: rgba(255,255,255,0.3);

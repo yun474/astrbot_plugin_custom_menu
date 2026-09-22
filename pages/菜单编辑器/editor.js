@@ -1,3 +1,93 @@
+// =============================================================
+//  AstrBot WebUI 桥接层
+//
+//  本页面跑在 WebUI 的 iframe 里，所有请求都通过 AstrBot 注入的
+//  window.AstrBotPluginPage 走，鉴权直接复用 WebUI 的登录态。
+//  素材取回 base64 后转成 blob URL 缓存，重绘时不会反复过桥。
+// =============================================================
+
+const BLANK_PX = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+
+const assetCache = new Map();   // "kind/name" -> blob URL
+const assetPending = new Set();
+let assetRerenderTimer = null;
+
+// basePath 是历史写法，这里映射回素材种类
+const BASE_PATH_KIND = {
+    '/raw_assets/backgrounds/': 'background',
+    '/raw_assets/icons/': 'icon',
+    '/raw_assets/widgets/': 'widget'
+};
+
+async function bridge() {
+    if (!window.AstrBotPluginPage) {
+        throw new Error('没有检测到 AstrBot 插件页桥接，请从 WebUI 的插件页面打开本编辑器');
+    }
+    await window.AstrBotPluginPage.ready();
+    return window.AstrBotPluginPage;
+}
+
+function b64ToBlobUrl(b64, mime) {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return URL.createObjectURL(new Blob([bytes], { type: mime || 'application/octet-stream' }));
+}
+
+// 素材到货后合并触发一次重绘，避免每张图都重排一遍
+function scheduleAssetRerender() {
+    if (assetRerenderTimer) return;
+    assetRerenderTimer = setTimeout(() => {
+        assetRerenderTimer = null;
+        try { renderAll(); } catch (e) { console.error(e); }
+    }, 80);
+}
+
+async function fetchAsset(kind, name, thumb) {
+    const key = `${kind}/${name}${thumb ? '#t' : ''}`;
+    if (assetCache.has(key)) return assetCache.get(key);
+    if (assetPending.has(key)) return BLANK_PX;
+
+    assetPending.add(key);
+    try {
+        const sdk = await bridge();
+        const params = { kind, name };
+        if (thumb) params.thumb = '1';
+        const res = await sdk.apiGet('asset', params);
+        const url = b64ToBlobUrl(res.b64, res.mime);
+        assetCache.set(key, url);
+        scheduleAssetRerender();
+        return url;
+    } catch (e) {
+        console.error('素材加载失败:', kind, name, e);
+        assetCache.set(key, BLANK_PX);   // 记下来，别反复重试
+        return BLANK_PX;
+    } finally {
+        assetPending.delete(key);
+    }
+}
+
+// 同步取素材地址：命中缓存直接给，没有就先占位并在后台去拉
+function assetUrl(kind, name, thumb) {
+    if (!name) return '';
+    const key = `${kind}/${name}${thumb ? '#t' : ''}`;
+    if (assetCache.has(key)) return assetCache.get(key);
+    fetchAsset(kind, name, thumb);
+    return BLANK_PX;
+}
+
+function pathAssetUrl(basePath, name, thumb) {
+    const kind = BASE_PATH_KIND[basePath];
+    return kind ? assetUrl(kind, name, thumb) : '';
+}
+
+function clearAssetCache() {
+    assetCache.forEach(url => {
+        if (typeof url === 'string' && url.startsWith('blob:')) URL.revokeObjectURL(url);
+    });
+    assetCache.clear();
+}
+
 const appState = {
     fullConfig: { menus: [] },
     currentMenuId: null,
@@ -31,11 +121,25 @@ let selectedItem = { gIdx: -1, iIdx: -1 };
 document.addEventListener('DOMContentLoaded', async () => {
     try {
         await Promise.all([loadAssets(), loadConfig()]);
-        initFonts();
+        await initFonts();
         if (appState.fullConfig.menus && appState.fullConfig.menus.length > 0) {
             switchMenu(appState.fullConfig.menus[0].id);
         } else {
             createNewMenu();
+        }
+
+        // 页面在 WebUI 的 iframe 里，挂载初期宽度可能还没确定，
+        // 侧栏折叠、窗口缩放也会改变可用宽度，所以持续跟随重绘。
+        const workspace = document.querySelector('.workspace');
+        if (workspace && window.ResizeObserver) {
+            let lastWidth = 0;
+            new ResizeObserver(() => {
+                const w = workspace.clientWidth;
+                if (w > 0 && Math.abs(w - lastWidth) > 1) {
+                    lastWidth = w;
+                    try { renderAll(); } catch (e) { console.error(e); }
+                }
+            }).observe(workspace);
         }
 
         // 全局事件监听
@@ -61,14 +165,9 @@ function getCurrentMenu() {
 }
 
 async function api(url, method = "GET", body = null) {
-    const opts = {
-        method,
-        headers: body && !(body instanceof FormData) ? { "Content-Type": "application/json" } : {}
-    };
-    if (body) opts.body = body instanceof FormData ? body : JSON.stringify(body);
-    const res = await fetch("/api" + url, opts);
-    if (!res.ok) throw res;
-    return res.headers.get("content-type")?.includes("json") ? res.json() : res;
+    const sdk = await bridge();
+    const endpoint = String(url).replace(/^\/+/, '');
+    return method === "GET" ? sdk.apiGet(endpoint) : sdk.apiPost(endpoint, body);
 }
 
 async function loadConfig() { appState.fullConfig = await api("/config"); }
@@ -104,28 +203,13 @@ async function exportImage() {
             alert("⏳ 正在导出菜单图片...\n请耐心等待浏览器下载提示。");
         }
 
-        const res = await fetch("/api/export_image", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(menu)
-        });
-
-        if (res.ok) {
-            const blob = await res.blob();
-            const a = document.createElement("a");
-            a.href = window.URL.createObjectURL(blob);
-            const isAnim = menu.bg_type === 'video' && menu.bg_video;
-            let ext = 'png';
-            if (isAnim) {
-                const fmt = menu.video_export_format || 'apng';
-                ext = (fmt === 'apng') ? 'png' : fmt;
-            }
-            a.download = `${menu.name}.${ext}`;
-            a.click();
-        } else {
-            const errText = await res.text();
-            alert("❌ 导出失败: " + errText);
+        let ext = 'png';
+        if (menu.bg_type === 'video' && menu.bg_video) {
+            const fmt = menu.video_export_format || 'apng';
+            ext = (fmt === 'apng') ? 'png' : fmt;
         }
+        const sdk = await bridge();
+        await sdk.download('export', { id: menu.id }, `${menu.name}.${ext}`);
     } catch(e) {
         alert("❌ 导出请求异常: " + e);
     }
@@ -154,26 +238,10 @@ async function uploadFile(type, inp) {
     const uploadPromises = files.map(async (f, idx) => {
         if (btn) btn.innerText = `⏳ ${idx + 1}/${files.length}`;
         
-        const d = new FormData();
-        d.append("type", type);
-        d.append("file", f);
-
         try {
-            const res = await fetch("/api/upload", {
-                method: "POST",
-                body: d
-            });
-            
-            if (!res.ok) {
-                throw new Error(`HTTP ${res.status}`);
-            }
-            
-            const json = await res.json();
-            
-            if (json.error) {
-                throw new Error(json.error);
-            }
-            
+            const sdk = await bridge();
+            const json = await sdk.upload(`upload/${type}`, f);
+
             // 单文件时自动设置到当前项
             if (files.length === 1 && json.filename) {
                 const m = getCurrentMenu();
@@ -234,26 +302,8 @@ async function exportTemplatePack() {
     if(!confirm(`即将导出菜单模板 "${menu.name}" 及其使用的图片、字体等素材。\n这会生成一个 .zip 文件。\n\n是否继续？`)) return;
 
     try {
-        const res = await fetch("/api/export_pack", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(menu)
-        });
-
-        if (res.ok) {
-            const blob = await res.blob();
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement("a");
-            a.href = url;
-            a.download = `${menu.name}_pack.zip`;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            window.URL.revokeObjectURL(url);
-        } else {
-            const err = await res.text();
-            alert("❌ 导出失败: " + err);
-        }
+        const sdk = await bridge();
+        await sdk.download('pack/export', { id: menu.id }, `${menu.name}_pack.zip`);
     } catch (e) {
         alert("❌ 导出请求错误: " + e);
     }
@@ -264,35 +314,24 @@ async function importTemplatePack(inp) {
     const file = inp.files[0];
     if (!file) return;
 
-    const formData = new FormData();
-    formData.append("file", file);
-
     try {
         const btn = inp.previousElementSibling;
-        const oldText = btn.innerText;
         btn.innerText = "⏳";
         btn.disabled = true;
 
-        const res = await fetch("/api/import_pack", {
-            method: "POST",
-            body: formData
-        });
+        const sdk = await bridge();
+        const data = await sdk.upload('pack/import', file);
 
-        if (res.ok) {
-            const data = await res.json();
-            alert(`✅ 导入成功！\n\n已导入菜单: ${data.menu_name}\n素材已自动解压。`);
-            await loadAssets();
-            initFonts();
-            await loadConfig();
-            if (appState.fullConfig.menus.length > 0) {
-                switchMenu(appState.fullConfig.menus[appState.fullConfig.menus.length - 1].id);
-            }
-        } else {
-            const err = await res.text();
-            alert("❌ 导入失败: " + err);
+        alert(`✅ 导入成功！\n\n已导入菜单: ${data.name}\n素材已自动解压。`);
+        clearAssetCache();
+        await loadAssets();
+        await initFonts();
+        await loadConfig();
+        if (appState.fullConfig.menus.length > 0) {
+            switchMenu(appState.fullConfig.menus[appState.fullConfig.menus.length - 1].id);
         }
     } catch (e) {
-        alert("❌ 导入错误: " + e);
+        alert("❌ 导入失败: " + (e && e.message ? e.message : e));
     } finally {
         inp.value = "";
         const btn = inp.previousElementSibling;
@@ -571,9 +610,10 @@ function renderCanvas(m) {
     const targetW = parseInt(m.canvas_width) || 1000;
     const targetH = parseInt(m.canvas_height) || 2000;
 
+    // iframe 里挂载初期 clientWidth 可能还是 0，这时别算出 scale(0) 把画布缩没了
     const editorWidth = cvsWrapper.parentElement.clientWidth - 120;
     let scale = 1;
-    if (editorWidth < targetW) scale = editorWidth / targetW;
+    if (editorWidth > 0 && editorWidth < targetW) scale = editorWidth / targetW;
     viewState.scale = scale;
 
     cvsWrapper.style.width = targetW + "px";
@@ -627,7 +667,7 @@ function renderCanvas(m) {
         vidPreview.style.display = 'block';
         imgPreview.style.display = 'none';
 
-        const targetSrc = `/raw_assets/videos/${m.bg_video}`;
+        const targetSrc = `${assetUrl('video', m.bg_video)}`;
         if (!vidPreview.src.endsWith(encodeURI(m.bg_video))) {
             vidPreview.src = targetSrc;
         }
@@ -659,7 +699,7 @@ function renderCanvas(m) {
         vidPreview.style.display = 'none';
         imgPreview.style.display = 'block';
 
-        const imgUrl = `url('/raw_assets/backgrounds/${m.background}')`;
+        const imgUrl = `url('${assetUrl('background', m.background)}')`;
         imgPreview.style.backgroundImage = imgUrl;
         imgPreview.style.backgroundRepeat = 'no-repeat';
 
@@ -815,7 +855,7 @@ function renderCanvas(m) {
                 const iBlur = iItemBlur > 0 ? `backdrop-filter: blur(${iItemBlur}px);` : '';
                 
                 const iRgba = hexToRgba(getStyle(item, 'bg_color', 'item_bg_color'), (item.bg_alpha !== undefined ? item.bg_alpha : m.item_bg_alpha) / 255);
-                const icon = item.icon ? `<img src="/raw_assets/icons/${item.icon}" class="item-icon" style="${item.icon_size ? `height:${item.icon_size}px` : ''}">` : '';
+                const icon = item.icon ? `<img src="${assetUrl('icon', item.icon)}" class="item-icon" style="${item.icon_size ? `height:${item.icon_size}px` : ''}">` : '';
 
                 const iNameSz = getStyle(item, 'name_size', 'item_name_size') || 26;
                 const iDescSz = getStyle(item, 'desc_size', 'item_desc_size') || 16;
@@ -895,7 +935,7 @@ function renderWidgets(container, m, shadowCss) {
         el.style.top = (parseInt(wid.y)||0) + "px";
 
         if (wid.type === 'image') {
-            const imgUrl = wid.content ? `/raw_assets/widgets/${wid.content}` : '';
+            const imgUrl = wid.content ? `${assetUrl('widget', wid.content)}` : '';
             el.innerHTML = imgUrl ? `<img src="${imgUrl}" style="width:100%;height:100%;object-fit:cover;pointer-events:none">` : `无图`;
             el.style.width = (parseInt(wid.width)||100) + "px";
             el.style.height = (parseInt(wid.height)||100) + "px";
@@ -1098,7 +1138,20 @@ function deleteCurrentItemProp(gIdx, iIdx) {
     }
 }
 
-function initFonts() { (appState.assets.fonts || []).forEach(n => { const id="f-"+n; if(!document.getElementById(id)) { const s=document.createElement("style"); s.id=id; s.textContent=`@font-face { font-family: '${cssFont(n)}'; src: url('/fonts/${n}'); }`; document.head.appendChild(s); } }); }
+async function initFonts() {
+    // 字体要先取回来变成 blob URL，@font-face 才能引用
+    for (const n of (appState.assets.fonts || [])) {
+        const id = "f-" + n;
+        if (document.getElementById(id)) continue;
+        const url = await fetchAsset('font', n);
+        if (url === BLANK_PX) continue;
+        const s = document.createElement("style");
+        s.id = id;
+        s.textContent = `@font-face { font-family: '${cssFont(n)}'; src: url('${url}'); }`;
+        document.head.appendChild(s);
+    }
+    scheduleAssetRerender();
+}
 function cssFont(n) { return n ? n.replace(/[^a-zA-Z0-9_]/g, '_') : 'sans-serif'; }
 
 async function openAutoFillModal() {
@@ -1518,7 +1571,7 @@ function generatePropForm(type, obj, gIdx, iIdx) {
 
         // 图标选择器 - 使用全局函数调用
         const iconPreview = obj.icon ? 
-            `<img src="/raw_assets/icons/${obj.icon}" style="width:32px;height:32px;object-fit:cover;border-radius:4px;border:1px solid #555;">` :
+            `<img src="${assetUrl('icon', obj.icon, true)}" style="width:32px;height:32px;object-fit:cover;border-radius:4px;border:1px solid #555;">` :
             `<div style="width:32px;height:32px;background:#333;border-radius:4px;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;border:1px solid #555;">无</div>`;
         html += `
         <div class="form-row">
@@ -1856,7 +1909,7 @@ function renderImagePickerGrid(images, basePath, currentValue) {
         item.style.position = 'relative';
         
         const imgHtml = `
-            <img src="${basePath}${img}" style="width:80px;height:80px;object-fit:cover;border-radius:4px;">
+            <img src="${pathAssetUrl(basePath, img, true)}" style="width:80px;height:80px;object-fit:cover;border-radius:4px;">
             <span style="max-width:90px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block;" title="${img}">${img}</span>
         `;
         
@@ -1993,7 +2046,7 @@ function renderImageSelect(containerId, type, currentValue, onChangeCallback) {
     // 预览图
     if (currentValue) {
         const img = document.createElement('img');
-        img.src = basePath + currentValue;
+        img.src = pathAssetUrl(basePath, currentValue, true);
         // 保持预览图不被压缩
         img.style.cssText = 'width:32px;height:32px;min-width:32px;object-fit:cover;border-radius:4px;border:1px solid #555;';
         wrapper.appendChild(img);
@@ -2053,7 +2106,7 @@ function openRandomBgModal() {
         item.style.cssText = 'display:flex; align-items:center; gap:8px; padding:5px; background:#333; border-radius:4px;';
         item.innerHTML = `
             <input type="checkbox" class="random-bg-check" value="${bg}" ${isChecked ? 'checked' : ''} style="width:16px;height:16px;">
-            <img src="/raw_assets/backgrounds/${bg}" style="width:40px;height:40px;object-fit:cover;border-radius:4px;">
+            <img src="${assetUrl('background', bg, true)}" style="width:40px;height:40px;object-fit:cover;border-radius:4px;">
             <span style="font-size:11px;color:#ccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;" title="${bg}">${bg}</span>
         `;
         container.appendChild(item);
@@ -2088,7 +2141,7 @@ function renderRandomBgList() {
     
     container.innerHTML = bgList.map(bg => `
         <div style="display:inline-flex; align-items:center; gap:4px; margin:2px; padding:3px 6px; background:#333; border-radius:4px; font-size:10px;">
-            <img src="/raw_assets/backgrounds/${bg}" style="width:20px;height:20px;object-fit:cover;border-radius:2px;">
+            <img src="${assetUrl('background', bg, true)}" style="width:20px;height:20px;object-fit:cover;border-radius:2px;">
             <span style="max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${bg}">${bg}</span>
             <span style="cursor:pointer;color:#f56c6c;" onclick="removeRandomBg('${bg}')">&times;</span>
         </div>

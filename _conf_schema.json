@@ -1,20 +1,14 @@
 {
-  "web_host": {
-    "type": "string",
-    "title": "监听地址 (内网/外网)",
-    "description": "选 0.0.0.0 允许局域网/公网访问；选 127.0.0.1 仅限本机访问(更安全)",
-    "default": "0.0.0.0",
-    "enum": ["0.0.0.0", "127.0.0.1"]
+  "enable_natural_language": {
+    "type": "bool",
+    "title": "启用自然语言触发",
+    "description": "开启后，群里问「你能干什么」「怎么用」这类话也会自动发菜单。关掉则只响应 /菜单 指令和你自己配的触发词。",
+    "default": true
   },
-  "web_port": {
+  "file_fallback_mb": {
     "type": "int",
-    "title": "Web 面板端口",
-    "default": 9876
-  },
-  "web_token": {
-    "type": "string",
-    "title": "Web 登录密钥",
-    "default": "astrbot123",
-    "description": "登录 Web 后台的密码"
+    "title": "转文件发送阈值 (MB)",
+    "description": "菜单图片超过这个体积时改用文件形式发送，避免被平台压缩或发送超时。",
+    "default": 15
   }
 }

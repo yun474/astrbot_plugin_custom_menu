@@ -1,6 +1,5 @@
+import re
 import traceback
-import imageio
-import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from pathlib import Path
 from typing import Optional, Tuple
@@ -22,13 +21,34 @@ BASE_ITEM_GAP_X = 15
 BASE_ITEM_GAP_Y = 15
 
 
+# 自带的中文字体，用作找不到指定字体时的回退，避免整屏方框
+_FALLBACK_FONTS = ("text.ttf", "title.ttf")
+
+
 def load_font(font_name: str, size: int) -> ImageFont.FreeTypeFont:
-    if not font_name or not plugin_storage.fonts_dir: return ImageFont.load_default()
-    font_path = plugin_storage.fonts_dir / font_name
+    """按名字加载字体。
+
+    指定字体不存在时依次回退到插件自带的中文字体，最后才用 Pillow 的
+    默认点阵字体 —— 后者不含中文，且旧版不接受字号，会把整个版面带偏。
+    """
+    size = max(1, int(size))
+    fonts_dir = plugin_storage.fonts_dir
+
+    if fonts_dir:
+        candidates = [font_name] if font_name else []
+        candidates += [f for f in _FALLBACK_FONTS if f != font_name]
+        for name in candidates:
+            path = fonts_dir / name
+            if path.is_file():
+                try:
+                    return ImageFont.truetype(str(path), size)
+                except OSError:
+                    continue
+
+    logger.warning(f"字体 {font_name!r} 不可用且没有可回退的中文字体，中文可能显示为方框")
     try:
-        if font_path.exists(): return ImageFont.truetype(str(font_path), int(size))
-        return ImageFont.load_default()
-    except:
+        return ImageFont.load_default(size)  # Pillow >= 10.1
+    except TypeError:
         return ImageFont.load_default()
 
 
@@ -149,57 +169,78 @@ def draw_glass_rect(base_img: Image.Image, box: tuple, color_hex: str, alpha: in
     base_img.alpha_composite(overlay)
 
 
+# 折行时的最小可断单元：拉丁单词整体、CJK 单字、连续空白
+_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[\'\u2019-][A-Za-z0-9]+)*[^\sA-Za-z0-9]?|\s+|.")
+
+
+def _text_width(draw, text: str, font) -> int:
+    if not text:
+        return 0
+    try:
+        return int(draw.textlength(text, font=font))
+    except Exception:
+        try:
+            return int(draw.textbbox((0, 0), text, font=font)[2])
+        except Exception:
+            return len(text) * 20
+
+
+def line_height(font, spacing: int = 0) -> int:
+    """单行行高。用字体度量而不是具体字符，保证每个格子里的文字对齐一致。"""
+    try:
+        ascent, descent = font.getmetrics()
+        return ascent + descent + spacing
+    except Exception:
+        return 20 + spacing
+
+
+def block_height(text: str, font, spacing: int = 0) -> int:
+    """一段（可能多行）文字的高度。"""
+    if not text:
+        return 0
+    lines = text.count("\n") + 1
+    return lines * line_height(font) + (lines - 1) * spacing
+
+
 def wrap_text_to_width(text: str, font, max_width: int, draw) -> str:
-    """将文本根据最大宽度自动换行"""
+    """按宽度折行。
+
+    中文逐字断行，拉丁单词整体挪到下一行；只有单个词本身就超宽
+    （超长英文单词、URL）时才硬断，不会再把普通单词拦腰砍断。
+    """
     if not text or max_width <= 0:
         return text
-    
-    # 如果已经有手动换行，分别处理每一行
-    lines = text.split('\n')
-    wrapped_lines = []
-    
-    for line in lines:
-        if not line:
-            wrapped_lines.append('')
+
+    out = []
+    for line in text.split("\n"):
+        if not line or _text_width(draw, line, font) <= max_width:
+            out.append(line)
             continue
-            
-        # 计算当前行宽度
-        try:
-            if hasattr(draw, 'textbbox'):
-                line_width = draw.textbbox((0, 0), line, font=font)[2]
+
+        current = ""
+        for token in _TOKEN_RE.findall(line):
+            if _text_width(draw, current + token, font) <= max_width:
+                current += token
+                continue
+
+            if current:
+                out.append(current.rstrip())
+                current = token.lstrip()
             else:
-                line_width = draw.textsize(line, font=font)[0]
-        except:
-            line_width = len(line) * 20
-        
-        # 如果不超过最大宽度，直接添加
-        if line_width <= max_width:
-            wrapped_lines.append(line)
-            continue
-        
-        # 需要换行
-        current_line = ''
-        for char in line:
-            test_line = current_line + char
-            try:
-                if hasattr(draw, 'textbbox'):
-                    test_width = draw.textbbox((0, 0), test_line, font=font)[2]
-                else:
-                    test_width = draw.textsize(test_line, font=font)[0]
-            except:
-                test_width = len(test_line) * 20
-            
-            if test_width <= max_width:
-                current_line = test_line
-            else:
-                if current_line:
-                    wrapped_lines.append(current_line)
-                current_line = char
-        
-        if current_line:
-            wrapped_lines.append(current_line)
-    
-    return '\n'.join(wrapped_lines)
+                current = token
+
+            # 单个 token 自己就超宽，只能硬断
+            while _text_width(draw, current, font) > max_width and len(current) > 1:
+                cut = len(current) - 1
+                while cut > 1 and _text_width(draw, current[:cut], font) > max_width:
+                    cut -= 1
+                out.append(current[:cut])
+                current = current[cut:]
+
+        if current.strip():
+            out.append(current.rstrip())
+
+    return "\n".join(out)
 
 
 def render_item_content(overlay_img, draw, item, box, fonts_map, shadow_cfg, menu_data, scale):
@@ -230,32 +271,15 @@ def render_item_content(overlay_img, draw, item, box, fonts_map, shadow_cfg, men
     name, desc = item.get("name", ""), item.get("desc", "")
     name_font, desc_font = fonts_map["name"], fonts_map["desc"]
     line_spacing = int(4 * scale)
-    
-    # 自动换行处理
-    if desc and text_max_width > 0:
-        desc = wrap_text_to_width(desc, desc_font, text_max_width, draw)
-
-    try:
-        if hasattr(name_font, "getbbox"):
-            # 使用参考字符计算高度，避免因英文/数字高度不一致导致重叠
-            ref_bbox = name_font.getbbox("Hg")
-            name_h = ref_bbox[3] - ref_bbox[1]
-        elif name:
-            name_h = name_font.getsize("Hg")[1]
-        else:
-            name_h = 0
-    except:
-        name_h = 20
-    try:
-        desc_h = 0
+    # 名称和描述都要折行：只折描述的话，长英文名会溢出去压住描述
+    if text_max_width > 0:
+        if name:
+            name = wrap_text_to_width(name, name_font, text_max_width, draw)
         if desc:
-            if hasattr(draw, "multiline_textbbox"):
-                desc_h = draw.multiline_textbbox((0, 0), desc, font=desc_font, spacing=line_spacing)[3] - \
-                         draw.multiline_textbbox((0, 0), desc, font=desc_font, spacing=line_spacing)[1]
-            else:
-                desc_h = draw.multiline_textsize(desc, font=desc_font, spacing=line_spacing)[1]
-    except:
-        desc_h = 0
+            desc = wrap_text_to_width(desc, desc_font, text_max_width, draw)
+
+    name_h = block_height(name, name_font, line_spacing)
+    desc_h = block_height(desc, desc_font, line_spacing)
 
     gap = int(5 * scale)
     total_text_height = name_h + (desc_h + gap if desc else 0)
@@ -267,8 +291,10 @@ def render_item_content(overlay_img, draw, item, box, fonts_map, shadow_cfg, men
     name_styles = get_text_style_str(item, 'item_name')
     desc_styles = get_text_style_str(item, 'item_desc')
 
-    if name: draw_text_with_shadow(draw, (text_start_x, text_start_y), name, name_font, fonts_map["name_color"],
-                                   name_shadow, scale=scale, text_styles=name_styles)
+    if name:
+        draw_text_with_shadow(draw, (text_start_x, text_start_y), name, name_font,
+                              fonts_map["name_color"], name_shadow, spacing=line_spacing,
+                              scale=scale, text_styles=name_styles)
     if desc: draw_text_with_shadow(draw, (text_start_x, text_start_y + name_h + gap), desc, desc_font,
                                    fonts_map["desc_color"], desc_shadow, spacing=line_spacing, scale=scale, text_styles=desc_styles)
 
@@ -735,6 +761,19 @@ def render_static(menu_data: dict) -> Image.Image:
 
 
 def render_animated(menu_data: dict, output_path: Path) -> Optional[Path]:
+    """渲染动态背景菜单。
+
+    imageio / numpy 只有这条路径用得到，所以延迟到这里才导入 ——
+    只用静态菜单的人不必被迫安装它们。
+    """
+    try:
+        import imageio
+        import numpy as np
+    except ImportError as e:
+        raise RuntimeError(
+            '动态背景需要额外依赖，请执行：pip install imageio imageio-ffmpeg numpy'
+        ) from e
+
     writer = None
     reader = None
     write_path = output_path

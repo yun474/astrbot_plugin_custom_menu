@@ -1,35 +1,55 @@
-## 版本更新速报
-1.8.0 每个菜单自定义触发  
-**示例:** `菜单自定义触发提示词`
-
-| <img src="./zhaopian/7.png" width="400"> |
-|:----------------------------------------:|
-
 # 🎨 可视化菜单编辑器
-> **架构**: Multiprocessing (Spawn) + Quart + Pillow  
-> **适配**: AstrBot (Star 协议) 
 
-**拒绝手写 JSON，拒绝繁琐配置！**  
-这是一个为 [AstrBot](https://github.com/Soulter/AstrBot) 量身打造的高级可视化功能菜单生成器。通过 Web 界面**所见即所得**地设计你的机器人菜单，支持**拖拽布局**、**自由缩放**、**自定义字体**与**全配色管理**。
+为 AstrBot 打造的可视化功能菜单生成器：拖拽布局、自由缩放、自定义字体与全配色管理，
+设计完直接渲染成静态图片，Bot 发菜单时毫秒级出图、零额外内存占用。
+
+> 本仓库是 [shskjw/astrbot_plugin_custom_menu](https://github.com/shskjw/astrbot_plugin_custom_menu) 的改造分支。
+> **编辑面板已内嵌进 AstrBot WebUI**，不再需要单独开端口。
 
 ---
-## 问题反馈
-可以进饰乐的群，460973561
-版本报错请手动更新   
-pip install -U pillow              
-pip show pillow
 
-## 依赖安装
-```text
-pip install Pillow imageio imageio-ffmpeg
-```
-国内下载慢可以用下面清华源的加速
-```text
-pip install Pillow imageio imageio-ffmpeg -i https://pypi.tuna.tsinghua.edu.cn/simple
-```
+## 🆕 这个分支改了什么
+
+### 编辑面板搬进了 WebUI
+
+老版本要发 `/开启后台`，插件会 spawn 一个子进程、单独监听 9876 端口，你再拿着 IP + 密钥去浏览器打开。
+现在直接在 **WebUI → 插件管理 → 本插件 →「菜单编辑器」** 里编辑：
+
+- 不用开端口、不用放行安全组、不用配 Docker 端口映射
+- 不用记密钥，鉴权直接复用 WebUI 的登录态
+- 没有第二个进程，也就没有"关了后台端口还被占着"的问题
+- 跟随 WebUI 的亮/暗主题
+
+### 指令触发不再"看运气"
+
+老版本用 `event_message_type(ALL)` 监听全部消息，谁先执行取决于插件加载顺序 ——
+排在前面的插件只要调用了 `stop_event_propagation()`，菜单这一轮就收不到消息，
+表现出来就是"有时候能用，有时候点了没反应"。现在：
+
+- `/菜单` 及别名走正式的 `CommandFilter`，精确匹配、带正优先级，触发稳定
+- 自定义触发词和自然语言兜底降到负优先级，排在所有插件之后，**不会再抢别人的指令**
+- 没命中时只查一次内存字典，不读盘也不解析 JSON（老版本对每条群消息都要读一遍 `menu.json`）
+
+### 其它修复
+
+| 问题 | 原因 |
+|---|---|
+| 提示"启动成功"但打不开后台 | 端口还没绑定就上报了成功，绑定失败无人知晓 |
+| 重载插件后端口一直被占 | 卸载钩子写成了 `on_unload`，而基类的钩子叫 `terminate`，从未被调用 |
+| 长英文功能名压住描述 | 只给描述做了折行，名称从不折行，且高度按单行写死 |
+| 英文描述被拦腰砍断 | 折行是逐字符切的，现在拉丁单词整体换行 |
+| 生成的图全是方框 | 字体缺失时退到 Pillow 默认点阵字体，既没有中文也没带字号 |
+| 没装 imageio 就完全用不了 | 它只有动态背景用得到，现在改成按需导入 |
+| 老用户数据没被迁移 | 迁移判断的是"新目录不存在"，而那时目录早已建好，是段死代码 |
+| 连发几次菜单重复渲染 | 渲染没有防重入，现在每个菜单一把锁 |
+
+还顺手删掉了未登录即可下载全部素材的接口、"没配管理员时人人都能开后台"的判断，
+以及三个死文件（`preview.py` 引用了不存在的函数、`renderer/base.py` 无人引用、`themes/miao.py` 是空文件）。
+
+---
+
 ## 效果展示
 
-展示网站 [效果展示，演示网站]( http://124.156.214.104:9876/) 密码：astrbot123
 
 
 
@@ -48,16 +68,11 @@ pip install Pillow imageio imageio-ffmpeg -i https://pypi.tuna.tsinghua.edu.cn/s
 | <img src="./zhaopian/2.png" width="400"> |
 |:----------------------------------------:|
 |                 *菜单功能展示*                 |
-**示例:** `llm判断是否发送`
-
-| <img src="./zhaopian/3.png" width="400"> |
-|:----------------------------------------:|
-|                 *菜单功能展示*                 |
 **示例:** `动态壁纸演示`
 
 | <img src="./zhaopian/4.png" width="400"> |
 |:----------------------------------------:|
-|           *动态壁纸展示具体可以上演示网站查看*            |
+|                 *动态壁纸展示*                  |
 
 **示例:** `前端打包素材+json`
 
@@ -68,183 +83,106 @@ pip install Pillow imageio imageio-ffmpeg -i https://pypi.tuna.tsinghua.edu.cn/s
 
 | <img src="./zhaopian/5.png" width="400"> |
 |:----------------------------------------:|
----
-## ✨ 核心特性
-
-*   **🖥️ Web 可视化编辑器**：内置独立 Web 后台，实时预览，修改即保存。
-*   **🖱️ 自由拖拽交互**：
-    *   支持**鼠标拖拽**任意改变文本位置。
-    *   支持**右下角手柄**拖动缩放字号。
-*   **🎨 全自定义外观**：
-    *   **背景图**：支持上传自定义背景，**长图自动适应**，不截断。
-    *   **字体库**：Web 端直接上传 `.ttf/.otf` 字体，浏览器与生成图实时同步。
-    *   **全配色**：主标题、副标题、分组、功能名、描述均可独立设色。
-*   **🛡️ 稳定性**：
-    *   采用 `multiprocessing (spawn)` 独立进程架构。
-*   **⚡ 动静分离**：
-    *   Web 端只负责编辑，生成配置后自动渲染为静态图片。
-    *   关闭后台后，Bot 依然可以毫秒级发送菜单，**零内存占用**。
-*   **🔐 权限控制**：只有配置文件中指定的管理员 (`admins_id`) 才能开启后台。
 
 ---
 
-## 📂 目录结构 (安装前必看)
+## 📦 环境要求
 
-请确保你的插件目录结构如下，否则可能无法启动：
-
-```text
-astrbot_plugin_custom_menu/
-├── main.py
-├── web_server.py
-├── storage.py
-├── _conf_schema.json
-├── README.md
-│
-├── fonts/              <-- [必须] 必须包含 title.ttf 和 text.ttf
-│
-├── renderer/
-│   ├── __init__.py
-│   └── menu.py
-│
-├── static/
-│   ├── style.css
-│   └── editor.js
-│
-└── templates/
-    ├── index.html
-    └── login.html
-```
-
----
-
-## 🛠️ 安装与依赖
-
-1. 安装 Python 库  
-
-本插件依赖轻量级异步 Web 框架和图像处理库，请在 AstrBot 环境下运行：
-
-code  
-Bash
+- **AstrBot ≥ v4.26.0** —— 插件页面机制是这个版本引入的，低于此版本面板无法显示
+- Python 依赖：`pillow`（必需）；用动态背景才需要 `imageio imageio-ffmpeg numpy`
 
 ```bash
-pip install quart hypercorn pillow
+pip install pillow
 ```
 
-2. 放置插件  
+动态背景（视频转 APNG/WebP/GIF）另外装：
 
-将插件解压至：
-
-```text
-AstrBot/data/plugins/astrbot_plugin_custom_menu/
+```bash
+pip install imageio imageio-ffmpeg numpy
 ```
 
-3. 首次运行  
-
-重启 AstrBot。  
-如果之前运行过旧版本，建议删除 `data/menu.json` 以便生成新的数据结构。
+国内网络可以加清华源：`-i https://pypi.tuna.tsinghua.edu.cn/simple`
 
 ---
 
-## 🎮 使用指南
+## 🛠️ 安装
 
-1. 开启后台 (仅管理员)
+把插件放到 `AstrBot/data/plugins/astrbot_plugin_custom_menu/`，重启 AstrBot 即可。
 
-在 Bot 聊天窗口发送指令：
+目录结构：
 
-code  
-Text
-
-```text
-/开启后台
+```
+astrbot_plugin_custom_menu/
+├── main.py              # 触发逻辑与生命周期
+├── webui.py             # 注册到 WebUI 的接口
+├── storage.py           # 配置与素材落盘
+├── _conf_schema.json
+├── fonts/               # [必须] title.ttf 和 text.ttf
+├── renderer/
+│   ├── __init__.py
+│   └── menu.py          # Pillow 出图
+└── pages/
+    └── 菜单编辑器/        # AstrBot 会自动扫到并挂成插件页面
+        ├── index.html
+        ├── editor.js
+        └── style.css
 ```
 
-Bot 会返回一个访问地址（如 http://你的IP:9876）和登录密钥。
-
-2. Web 编辑流程  
-
-登录：浏览器打开地址，输入密钥。  
-
-上传素材：  
-* 上传背景图。  
-* 上传字体文件（支持中文预览）。  
-
-调整布局：  
-* 选择列数（1~5 列自动网格）。  
-* 设置标题对齐方式（左 / 中 / 右）。  
-
-自由组件：  
-* 点击 “+ 添加” 增加自由文本。  
-* 在画布中拖拽移动位置。  
-* 拖动文本框右下角手柄调整大小。  
-
-保存：  
-* 点击左上角 “💾 保存并生成”。
-
-3. 发送菜单  
-
-回到 Bot 聊天窗口发送：
-
-code  
-Text
-
-```text
-/菜单
-```
-
-即可看到刚刚设计好的菜单图片。
-
-4. 关闭后台  
-
-编辑完成后，建议关闭 Web 服务以释放资源：
-
-code  
-Text
-
-```text
-/关闭后台
-```
+> `pages/<目录名>/index.html` 是 AstrBot 约定的插件页面入口，目录名就是 WebUI 上显示的页面名。
 
 ---
 
-## ⚙️ 配置文件
+## 🎮 使用
 
-可在 AstrBot 管理面板或 plugin_config.json 中修改：
+### 编辑菜单
 
-* web_host  
-* web_port  
-* web_token  
-* admins_id  
+打开 **WebUI → 插件管理 → astrbot_plugin_custom_menu →「菜单编辑器」**：
 
----
+1. 上传背景图、字体、图标
+2. 选列数、标题对齐方式，拖拽调整位置，拖右下角手柄改字号
+3. 点「💾 保存」——保存后出图缓存会自动作废，下次触发重新渲染
 
+### 发菜单
 
-## ❓ 常见问题 (FAQ)
+在聊天里发 `/菜单`，别名还有 `功能` `帮助` `指令` `列表` `说明书` `help` `menu`。
 
-**Q1: 开启后台后，浏览器打不开？**
-
-检查配置中 web_host 是否为 0.0.0.0。  
-云服务器请在安全组中放行端口。  
-Docker 用户请确认端口映射。
-
-**Q2: 修改了样式，但网页上没变化？**
-
-这是浏览器缓存导致的。  
-请使用强制刷新或无痕窗口访问。
-
-**Q3: 生成的图片里全是方框？**
-
-这是因为缺少字体文件或文件名不正确。  
-请确保 fonts 目录下存在 title.ttf 和 text.ttf。
-
-**Q4: 提示“权限不足”？**
-
-请在 AstrBot 全局配置中将你的 ID 加入 admins_id。
-
-**Q5: 点击“开启后台”提示进程退出？**
-
-请检查插件目录下的 web_crash.log。  
-常见原因是端口被占用或依赖未安装。
+也可以给每个菜单单独配触发词（编辑器顶部那一栏，逗号/分号/空格分隔）。
+配了触发词的菜单只响应自己的词；没配的作为默认菜单，响应 `/菜单`。
 
 ---
 
-## 📝 更新日志
+## ⚙️ 配置项
+
+在 WebUI 的插件配置里改：
+
+| 配置 | 说明 | 默认 |
+|---|---|---|
+| `enable_natural_language` | 群里问「你能干什么」这类话是否也发菜单 | 开 |
+| `file_fallback_mb` | 图片超过这个体积改用文件形式发送 | 15 |
+
+---
+
+## ❓ 常见问题
+
+**面板页面不显示？**
+先确认 AstrBot ≥ v4.26.0，再确认 `pages/菜单编辑器/index.html` 确实存在，然后重载插件。
+
+**页面打开是空白的？**
+浏览器缓存，强制刷新（Ctrl+F5）或用无痕窗口。
+
+**生成的图里中文是方框？**
+`fonts/` 下要有 `title.ttf` 和 `text.ttf`。现在即使指定的字体缺失也会自动回退到这两个，
+如果它们也没了才会退到不含中文的默认字体。
+
+**动态背景渲染失败？**
+需要 `imageio-ffmpeg` 提供的 ffmpeg 二进制，装上再试。
+
+**改了样式但网页没变化？**
+同样是浏览器缓存，强制刷新。
+
+---
+
+## 📄 致谢
+
+原作者 [@shskjw](https://github.com/shskjw)，原仓库 <https://github.com/shskjw/astrbot_plugin_custom_menu>。
+本分支在其基础上做了架构迁移与问题修复，许可证沿用 AGPL-3.0。

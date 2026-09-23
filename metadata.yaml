@@ -1,6 +1,8 @@
 name: astrbot_plugin_custom_menu
+display_name: 可视化菜单
 desc: Web 可视化菜单编辑器，编辑面板内嵌在 AstrBot WebUI 插件页
-help: 发送 /菜单 查看菜单（别名：功能/帮助/指令/列表/说明书/help/menu）；编辑面板在 WebUI → 插件管理 →「菜单编辑器」。需要 AstrBot >= v4.26.0。
+help: 发送 /菜单 查看菜单（别名：功能/帮助/指令/列表/说明书/help/menu）；编辑面板在 WebUI → 插件管理 →「菜单编辑器」。
 version: 2.1.0
 author: shskjw
 repo: https://github.com/yun474/astrbot_plugin_custom_menu
+astrbot_version: ">=4.26.0"

@@ -9,15 +9,9 @@
 const BLANK_PX = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 
 const assetCache = new Map();   // "kind/name" -> blob URL
+const assetSize = new Map();    // "kind/name" -> { w, h }，背景图按比例算画布高度要用
 const assetPending = new Set();
 let assetRerenderTimer = null;
-
-// basePath 是历史写法，这里映射回素材种类
-const BASE_PATH_KIND = {
-    '/raw_assets/backgrounds/': 'background',
-    '/raw_assets/icons/': 'icon',
-    '/raw_assets/widgets/': 'widget'
-};
 
 async function bridge() {
     if (!window.AstrBotPluginPage) {
@@ -27,11 +21,75 @@ async function bridge() {
     return window.AstrBotPluginPage;
 }
 
-function b64ToBlobUrl(b64, mime) {
+function b64ToBytes(b64) {
     const bin = atob(b64);
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return URL.createObjectURL(new Blob([bytes], { type: mime || 'application/octet-stream' }));
+    return bytes;
+}
+
+function b64ToBlobUrl(b64, mime) {
+    return URL.createObjectURL(new Blob([b64ToBytes(b64)], { type: mime || 'application/octet-stream' }));
+}
+
+const errMsg = e => (e && e.message) || String(e);
+
+// 用户输入的文字拼进 HTML 前先转义，名字里带 < " 之类的字符也不会把页面搞乱
+function esc(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+
+// 数字输入框清空时删掉字段，让它回落到默认值。
+// 存成 NaN 会被序列化成 null，出图那边就会丢背景甚至直接渲染失败
+function setNumber(obj, key, raw, parse = parseInt) {
+    const n = parse(raw);
+    if (Number.isFinite(n)) obj[key] = n;
+    else delete obj[key];
+}
+
+// =============================================================
+//  提示与确认
+//  AstrBot 的插件页 iframe 没开 allow-modals，alert / confirm 会被浏览器
+//  直接吞掉（confirm 恒为 false），所以一律用页面内的组件实现。
+// =============================================================
+
+function toast(msg, type = 'ok', ms = 2800) {
+    const el = document.createElement('div');
+    el.className = `toast toast-${type}`;
+    el.textContent = msg;
+    document.getElementById('toastBox').appendChild(el);
+    const close = () => { el.classList.add('hide'); setTimeout(() => el.remove(), 300); };
+    if (ms > 0) setTimeout(close, ms);
+    return close;
+}
+
+function confirmBox(text, okText = '确定') {
+    const modal = document.getElementById('confirmModal');
+    const ok = document.getElementById('confirmOk');
+    const cancel = document.getElementById('confirmCancel');
+    document.getElementById('confirmText').textContent = text;
+    ok.textContent = okText;
+    modal.style.display = 'flex';
+    ok.focus();
+
+    return new Promise(resolve => {
+        const finish = (value) => {
+            modal.style.display = 'none';
+            window.removeEventListener('keydown', onKey, true);
+            ok.onclick = cancel.onclick = modal.onclick = null;
+            resolve(value);
+        };
+        // 捕获阶段拦下所有按键，弹窗开着时 Delete / 方向键不会再去动画布
+        const onKey = (e) => {
+            e.stopPropagation();
+            if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+            else if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+        };
+        ok.onclick = () => finish(true);
+        cancel.onclick = () => finish(false);
+        modal.onclick = (e) => { if (e.target === modal) finish(false); };
+        window.addEventListener('keydown', onKey, true);
+    });
 }
 
 // 素材到货后合并触发一次重绘，避免每张图都重排一遍
@@ -56,15 +114,51 @@ async function fetchAsset(kind, name, thumb) {
         const res = await sdk.apiGet('asset', params);
         const url = b64ToBlobUrl(res.b64, res.mime);
         assetCache.set(key, url);
+        if (res.width && res.height) assetSize.set(`${kind}/${name}`, { w: res.width, h: res.height });
+        // 弹窗里的缩略图不会跟着画布重绘，到货后直接把占位图换掉
+        document.querySelectorAll('img[data-asset]').forEach(img => {
+            if (img.dataset.asset === key) img.src = url;
+        });
         scheduleAssetRerender();
         return url;
     } catch (e) {
         console.error('素材加载失败:', kind, name, e);
         assetCache.set(key, BLANK_PX);   // 记下来，别反复重试
+        toast(`素材「${name}」加载失败：${errMsg(e)}`, 'error', 5000);
         return BLANK_PX;
     } finally {
         assetPending.delete(key);
     }
+}
+
+// 字体直接用字节构造 FontFace，不经过任何 URL。
+// 只加载当前菜单实际用到的字体，而且不阻塞首屏：内置字体一个就二十来 MB，
+// 以前要等所有字体都过完桥才开始画，远程部署时编辑器会白屏很久。
+const fontState = new Map();   // 字体文件名 -> 'loading' | 'loaded' | 'failed'
+
+async function loadFont(name) {
+    if (!name || fontState.has(name)) return;
+    fontState.set(name, 'loading');
+    try {
+        const sdk = await bridge();
+        const res = await sdk.apiGet('asset', { kind: 'font', name });
+        const face = new FontFace(cssFont(name), b64ToBytes(res.b64).buffer);
+        document.fonts.add(await face.load());
+        fontState.set(name, 'loaded');
+    } catch (e) {
+        console.error('字体加载失败:', name, e);
+        fontState.set(name, 'failed');
+    }
+}
+
+function menuFonts(m) {
+    const names = [m.title_font, m.subtitle_font, m.group_title_font, m.group_sub_font, m.item_name_font, m.item_desc_font];
+    (m.groups || []).forEach(g => {
+        names.push(g.title_font, g.sub_font, g.text_font);
+        (g.items || []).forEach(i => names.push(i.name_font, i.desc_font));
+    });
+    (m.custom_widgets || []).forEach(w => names.push(w.font));
+    return names.filter(Boolean);
 }
 
 // 同步取素材地址：命中缓存直接给，没有就先占位并在后台去拉
@@ -76,9 +170,9 @@ function assetUrl(kind, name, thumb) {
     return BLANK_PX;
 }
 
-function pathAssetUrl(basePath, name, thumb) {
-    const kind = BASE_PATH_KIND[basePath];
-    return kind ? assetUrl(kind, name, thumb) : '';
+// 素材图片的 src 和 data-asset：先放占位图，素材到货后 fetchAsset 按 data-asset 自动换上
+function assetImg(kind, name, thumb) {
+    return `src="${assetUrl(kind, name, thumb)}" data-asset="${esc(`${kind}/${name}${thumb ? '#t' : ''}`)}"`;
 }
 
 function clearAssetCache() {
@@ -121,7 +215,6 @@ let selectedItem = { gIdx: -1, iIdx: -1 };
 document.addEventListener('DOMContentLoaded', async () => {
     try {
         await Promise.all([loadAssets(), loadConfig()]);
-        await initFonts();
         if (appState.fullConfig.menus && appState.fullConfig.menus.length > 0) {
             switchMenu(appState.fullConfig.menus[0].id);
         } else {
@@ -157,6 +250,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     } catch (e) {
         console.error("Init failed:", e);
+        toast('编辑器初始化失败：' + errMsg(e), 'error', 0);
     }
 });
 
@@ -173,45 +267,37 @@ async function api(url, method = "GET", body = null) {
 async function loadConfig() { appState.fullConfig = await api("/config"); }
 async function loadAssets() { appState.assets = await api("/assets"); }
 
-// --- 修复提示逻辑：保存功能 ---
 async function saveAll() {
-    // 获取按钮以改变状态
     const btn = document.querySelector('button[onclick="saveAll()"]');
     const oldText = btn ? btn.innerText : "💾 保存";
-    if(btn) { btn.innerText = "⏳ 保存中..."; btn.disabled = true; }
+    if (btn) { btn.innerText = "⏳ 保存中..."; btn.disabled = true; }
 
     try {
         await api("/config", "POST", appState.fullConfig);
-        alert("✅ 配置已保存成功！");
-    } catch(e) {
-        alert("❌ 保存失败: " + e);
+        toast("✅ 配置已保存");
+    } catch (e) {
+        toast("❌ 保存失败：" + errMsg(e), 'error', 6000);
     } finally {
-        if(btn) { btn.innerText = oldText; btn.disabled = false; }
+        if (btn) { btn.innerText = oldText; btn.disabled = false; }
     }
 }
 
-// --- 修复提示逻辑：导出图片 ---
+// 先渲染（出错能拿到具体原因），成功后再下载缓存好的成品
 async function exportImage() {
+    const menu = getCurrentMenu();
+    const done = toast(menu.bg_type === 'video'
+        ? "⏳ 正在生成动态菜单，可能要几十秒..."
+        : "⏳ 正在导出菜单图片...", 'info', 0);
     try {
         await api("/config", "POST", appState.fullConfig);
-        const menu = getCurrentMenu();
-
-        // 视频导出提示
-        if (menu.bg_type === 'video') {
-            alert("⏳ 正在生成动态视频菜单...\n这可能需要几十秒时间，请耐心等待浏览器下载提示。");
-        } else {
-            alert("⏳ 正在导出菜单图片...\n请耐心等待浏览器下载提示。");
-        }
-
-        let ext = 'png';
-        if (menu.bg_type === 'video' && menu.bg_video) {
-            const fmt = menu.video_export_format || 'apng';
-            ext = (fmt === 'apng') ? 'png' : fmt;
-        }
         const sdk = await bridge();
-        await sdk.download('export', { id: menu.id }, `${menu.name}.${ext}`);
-    } catch(e) {
-        alert("❌ 导出请求异常: " + e);
+        const { filename } = await sdk.apiPost('export/prepare', { id: menu.id });
+        await sdk.download('export', { id: menu.id }, filename);
+        toast("✅ 已导出：" + filename);
+    } catch (e) {
+        toast("❌ 导出失败：" + errMsg(e), 'error', 8000);
+    } finally {
+        done();
     }
 }
 
@@ -221,120 +307,109 @@ function getStyle(obj, key, fallbackGlobalKey) {
     return m[fallbackGlobalKey];
 }
 
-// --- 修复提示逻辑：上传文件 ---
+// AstrBot 的插件接口跑在一个沿用 Quart 默认 16MB 请求体上限的兼容层里，
+// 字体、视频、素材包动辄超过这个数，所以统一切成 4MB 一片顺序上传，后端再拼回去
+const UPLOAD_CHUNK = 4 * 1024 * 1024;
+
+async function uploadInChunks(endpoint, file, onProgress) {
+    const sdk = await bridge();
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+    const total = Math.max(1, Math.ceil(file.size / UPLOAD_CHUNK));
+    let res;
+    for (let i = 0; i < total; i++) {
+        const part = file.slice(i * UPLOAD_CHUNK, (i + 1) * UPLOAD_CHUNK);
+        res = await sdk.upload(`${endpoint}/${id}/${i}/${total}`, new File([part], file.name, { type: file.type }));
+        if (onProgress) onProgress(part.size);
+    }
+    return res;   // 最后一片的响应就是最终结果
+}
+
 async function uploadFile(type, inp) {
     const files = Array.from(inp.files || []);
     if (files.length === 0) return;
 
-    let successCount = 0;
-    let failCount = 0;
-    const failedFiles = [];
-
-    // 找到显示状态的按钮
     const btn = inp.previousElementSibling;
     const originalText = btn ? btn.innerText : '';
-    
-    // 使用 Promise.all 并行上传所有文件以提高效率
-    const uploadPromises = files.map(async (f, idx) => {
-        if (btn) btn.innerText = `⏳ ${idx + 1}/${files.length}`;
-        
-        try {
-            const sdk = await bridge();
-            const json = await sdk.upload(`upload/${type}`, f);
+    const totalBytes = files.reduce((n, f) => n + f.size, 0) || 1;
+    let sentBytes = 0;
+    const progress = (n) => {
+        sentBytes += n;
+        if (btn) btn.innerText = `⏳ ${Math.floor(sentBytes * 100 / totalBytes)}%`;
+    };
+    progress(0);
 
-            // 单文件时自动设置到当前项
-            if (files.length === 1 && json.filename) {
-                const m = getCurrentMenu();
-                if (type === 'video') m.bg_video = json.filename;
-                else if (type === 'background') m.background = json.filename;
-                else if (type === 'icon' && selectedItem.gIdx !== -1) {
-                    updateProp('item', selectedItem.gIdx, selectedItem.iIdx, 'icon', json.filename);
-                } else if (type === 'widget_img' && selectedWidgetIdx !== -1) {
-                    updateWidget('content', json.filename);
-                }
-            }
-            
-            return { success: true, filename: f.name };
+    const results = await Promise.all(files.map(async (f) => {
+        try {
+            const json = await uploadInChunks(`upload/${type}`, f, progress);
+            return { ok: true, name: f.name, saved: json.filename };
         } catch (e) {
             console.error(`File ${f.name} upload failed:`, e);
-            return { success: false, filename: f.name, error: e.message };
+            return { ok: false, name: f.name, error: errMsg(e) };
         }
-    });
-
-    // 等待所有上传完成
-    const results = await Promise.all(uploadPromises);
-    
-    results.forEach(r => {
-        if (r.success) {
-            successCount++;
-        } else {
-            failCount++;
-            failedFiles.push(r.filename);
-        }
-    });
+    }));
 
     if (btn) btn.innerText = originalText;
+    inp.value = "";
 
-    // 刷新资源列表
+    // 单文件时自动设置到当前项
+    const saved = results.filter(r => r.ok);
+    if (files.length === 1 && saved.length === 1) {
+        const m = getCurrentMenu();
+        const filename = saved[0].saved;
+        if (type === 'video') m.bg_video = filename;
+        else if (type === 'background') m.background = filename;
+        else if (type === 'icon' && selectedItem.gIdx !== -1) m.groups[selectedItem.gIdx].items[selectedItem.iIdx].icon = filename;
+        else if (type === 'widget_img' && selectedWidgetIdx !== -1) m.custom_widgets[selectedWidgetIdx].content = filename;
+    }
+
     await loadAssets();
-    if (type === 'font') initFonts();
     renderAll();
-
-    // 刷新编辑器面板
-    if (selectedWidgetIdx !== -1) updateWidgetEditor(getCurrentMenu());
     if (selectedItem.gIdx !== -1) openContextEditor('item', selectedItem.gIdx, selectedItem.iIdx);
 
-    // 提示结果
-    let msg = `上传完成\n✅ 成功: ${successCount} 个`;
-    if (failCount > 0) {
-        msg += `\n❌ 失败: ${failCount} 个\n失败文件: ${failedFiles.join(', ')}`;
+    const failed = results.filter(r => !r.ok);
+    if (failed.length === 0) {
+        toast(`✅ 已上传 ${saved.length} 个文件`);
+    } else {
+        toast(`上传完成：成功 ${saved.length} 个，失败 ${failed.length} 个\n` +
+            failed.map(r => `${r.name}：${r.error}`).join('\n'), 'error', 8000);
     }
-    alert(msg);
-    
-    inp.value = "";
 }
 
-// --- 修复提示逻辑：导出模版包 ---
 async function exportTemplatePack() {
-    await api("/config", "POST", appState.fullConfig);
     const menu = getCurrentMenu();
+    if (!await confirmBox(`即将导出菜单模板「${menu.name}」及其用到的图片、字体等素材，打包成一个 .zip 文件。\n\n导出前会先保存当前配置。`, '导出')) return;
 
-    if(!confirm(`即将导出菜单模板 "${menu.name}" 及其使用的图片、字体等素材。\n这会生成一个 .zip 文件。\n\n是否继续？`)) return;
-
+    const done = toast("⏳ 正在打包...", 'info', 0);
     try {
+        await api("/config", "POST", appState.fullConfig);
         const sdk = await bridge();
         await sdk.download('pack/export', { id: menu.id }, `${menu.name}_pack.zip`);
+        toast("✅ 模板包已导出");
     } catch (e) {
-        alert("❌ 导出请求错误: " + e);
+        toast("❌ 导出失败：" + errMsg(e), 'error', 8000);
+    } finally {
+        done();
     }
 }
 
-// --- 修复提示逻辑：导入模版包 ---
 async function importTemplatePack(inp) {
     const file = inp.files[0];
     if (!file) return;
+    const btn = inp.previousElementSibling;
+    btn.innerText = "⏳";
+    btn.disabled = true;
 
     try {
-        const btn = inp.previousElementSibling;
-        btn.innerText = "⏳";
-        btn.disabled = true;
-
-        const sdk = await bridge();
-        const data = await sdk.upload('pack/import', file);
-
-        alert(`✅ 导入成功！\n\n已导入菜单: ${data.name}\n素材已自动解压。`);
+        const data = await uploadInChunks('pack/import', file);
         clearAssetCache();
-        await loadAssets();
-        await initFonts();
-        await loadConfig();
-        if (appState.fullConfig.menus.length > 0) {
-            switchMenu(appState.fullConfig.menus[appState.fullConfig.menus.length - 1].id);
-        }
+        await Promise.all([loadAssets(), loadConfig()]);
+        const menus = appState.fullConfig.menus;
+        if (menus.length > 0) switchMenu(menus[menus.length - 1].id);
+        toast(`✅ 已导入菜单「${data.name}」，素材已自动解压`);
     } catch (e) {
-        alert("❌ 导入失败: " + (e && e.message ? e.message : e));
+        toast("❌ 导入失败：" + errMsg(e), 'error', 8000);
     } finally {
         inp.value = "";
-        const btn = inp.previousElementSibling;
         btn.innerText = "📦";
         btn.disabled = false;
     }
@@ -397,20 +472,27 @@ function duplicateMenu() {
     const newMenu = JSON.parse(JSON.stringify(current));
     newMenu.id = "m_" + Date.now();
     newMenu.name = newMenu.name + " (副本)";
+    // 副本和原菜单的触发条件一模一样，都启用的话一次会发两张图
+    newMenu.enabled = false;
     appState.fullConfig.menus.push(newMenu);
     switchMenu(newMenu.id);
-    alert(`✅ 已复制模板：${newMenu.name}`);
+    toast(`已复制为「${newMenu.name}」。副本默认停用，免得和原菜单一起响应；改好后点「已停用」启用，再保存`, 'ok', 6000);
 }
 
-function deleteMenu() {
-    if (appState.fullConfig.menus.length <= 1) return alert("至少保留一个菜单模板。");
-    if (confirm("确定删除当前菜单模板？此操作不可逆。")) {
-        const menuToDeleteId = appState.currentMenuId;
-        appState.fullConfig.menus = appState.fullConfig.menus.filter(m => m.id !== menuToDeleteId);
-        api("/config", "POST", appState.fullConfig).then(() => {
-            switchMenu(appState.fullConfig.menus[0].id);
-            alert("✅ 菜单已删除。");
-        });
+async function deleteMenu() {
+    const menus = appState.fullConfig.menus;
+    if (menus.length <= 1) return toast("至少要保留一个菜单模板", 'warn');
+    const menu = getCurrentMenu();
+    if (!await confirmBox(`确定删除菜单模板「${menu.name}」？\n\n删除后会立即保存（连同其它未保存的修改），无法撤销。`, '删除')) return;
+
+    appState.fullConfig.menus = menus.filter(m => m.id !== menu.id);
+    try {
+        await api("/config", "POST", appState.fullConfig);
+        switchMenu(appState.fullConfig.menus[0].id);
+        toast(`✅ 已删除「${menu.name}」`);
+    } catch (e) {
+        appState.fullConfig.menus = menus;
+        toast("❌ 删除失败：" + errMsg(e), 'error', 6000);
     }
 }
 
@@ -422,7 +504,7 @@ function toggleEnable() {
 
 function renderMenuSelect() {
     document.getElementById("menuSelect").innerHTML = appState.fullConfig.menus.map(m =>
-        `<option value="${m.id}" ${m.id === appState.currentMenuId ? 'selected' : ''}>${m.enabled ? '' : '[停] '}${m.name}</option>`
+        `<option value="${esc(m.id)}" ${m.id === appState.currentMenuId ? 'selected' : ''}>${m.enabled ? '' : '[停] '}${esc(m.name)}</option>`
     ).join('');
     document.getElementById("menuNameInput").value = getCurrentMenu().name;
     const btn = document.getElementById("enableBtn");
@@ -442,16 +524,17 @@ function renderAll() {
     updateWidgetEditor(m);
 }
 
+// 正在输入的框不回写：否则敲 "1." 会被立刻改回 "1"，小数根本输不进去
 function setValue(id, val) {
     const el = document.getElementById(id);
-    if (el) el.value = val;
+    if (el && el !== document.activeElement) el.value = val;
 }
 
 function renderSelect(id, opts, sel, def) {
     const el = document.getElementById(id);
     if (!el) return;
     el.innerHTML = (def ? `<option value="">${def}</option>` : '') + (opts || []).map(o =>
-        `<option value="${o}" ${o === sel ? 'selected' : ''}>${o}</option>`
+        `<option value="${esc(o)}" ${o === sel ? 'selected' : ''}>${esc(o)}</option>`
     ).join('');
 }
 
@@ -500,6 +583,11 @@ function updateFormInputs(m) {
 
     toggleBgPanel();
 
+    setValue("cTextBgP", m.group_sub_bg_color || "#333333");
+    setValue("cTextBgT", m.group_sub_bg_color || "#333333");
+    setValue("textBgAlpha", m.group_sub_bg_alpha !== undefined ? m.group_sub_bg_alpha : 200);
+    setValue("textBgBlur", m.group_sub_bg_blur !== undefined ? m.group_sub_bg_blur : "");
+
     setValue("boxColor", m.group_bg_color || "#000000");
     setValue("boxBlur", m.group_blur_radius || 0);
     setValue("boxAlpha", m.group_bg_alpha !== undefined ? m.group_bg_alpha : 50);
@@ -541,14 +629,17 @@ function updateFormInputs(m) {
     }
 }
 
+const MENU_INT_KEYS = ['layout_columns', 'item_height', 'canvas_width', 'canvas_height', 'group_blur_radius', 'item_blur_radius', 'group_bg_alpha', 'item_bg_alpha', 'shadow_offset_x', 'shadow_offset_y', 'shadow_radius', 'bg_custom_width', 'bg_custom_height', 'group_custom_width', 'group_custom_height', 'item_custom_width', 'item_custom_height', 'video_fps', 'group_sub_bg_alpha', 'group_sub_bg_blur'];
+const MENU_FLOAT_KEYS = ['export_scale', 'video_start', 'video_end', 'video_scale'];
+
 function updateMenuMeta(key, val) {
     const m = getCurrentMenu();
-    if (['layout_columns', 'item_height', 'canvas_width', 'canvas_height', 'group_blur_radius', 'item_blur_radius', 'group_bg_alpha', 'item_bg_alpha', 'shadow_offset_x', 'shadow_offset_y', 'shadow_radius', 'bg_custom_width', 'bg_custom_height', 'group_custom_width', 'group_custom_height', 'item_custom_width', 'item_custom_height', 'video_fps'].includes(key)) {
-        m[key] = parseInt(val);
+    if (MENU_INT_KEYS.includes(key)) {
+        setNumber(m, key, val);
+    } else if (MENU_FLOAT_KEYS.includes(key)) {
+        setNumber(m, key, val, parseFloat);
     } else if (key === 'use_canvas_size' || key === 'shadow_enabled') {
         m[key] = val === 'true' || val === true;
-    } else if (['export_scale', 'video_start', 'video_end', 'video_scale'].includes(key)) {
-        m[key] = parseFloat(val);
     } else {
         m[key] = val;
     }
@@ -565,12 +656,12 @@ function updateUnifiedBgParams(type, val) {
         m.video_align = val;
         m.video_align_y = val;
     } else if (type === 'scale') {
-        const floatVal = parseFloat(val);
-        m.video_scale = floatVal;
-        setValue("bgScaleRange", floatVal);
-        setValue("bgScaleInput", floatVal);
+        setNumber(m, 'video_scale', val, parseFloat);
+        const scale = m.video_scale ?? 1.0;
+        setValue("bgScaleRange", scale);
+        setValue("bgScaleInput", scale);
         const span = document.getElementById("bgScaleVal");
-        if(span) span.innerText = floatVal;
+        if (span) span.innerText = scale;
     }
     renderCanvas(m);
 }
@@ -597,7 +688,6 @@ function toggleBgPanel() {
         imgPanel.style.display = "block";
         vidPanel.style.display = "none";
     }
-    renderCanvas(getCurrentMenu());
 }
 
 // =============================================================
@@ -685,6 +775,12 @@ function closeRealPreview() {
     document.getElementById('realPreviewModal').style.display = 'none';
 }
 
+// 出图时配了随机背景就只从随机列表里挑，单张背景不生效；画布上预览随机列表的第一张
+function previewBackground(m) {
+    const pool = (m.backgrounds || []).filter(Boolean);
+    return pool.length ? pool[0] : (m.background || '');
+}
+
 function renderCanvas(m) {
     const cvsWrapper = document.getElementById("canvas-wrapper");
     const cvs = document.getElementById("canvas");
@@ -702,35 +798,39 @@ function renderCanvas(m) {
     if (editorWidth > 0 && editorWidth < targetW) scale = editorWidth / targetW;
     viewState.scale = scale;
 
-    cvsWrapper.style.width = targetW + "px";
+    const bgType = m.bg_type || 'image';
+    const bgName = bgType === 'image' ? previewBackground(m) : '';
+    const hasVideo = bgType === 'video' && !!m.bg_video;
+    const hasImage = !!bgName;
+
     cvs.style.width = targetW + "px";
     cvs.style.transform = `scale(${scale})`;
     cvs.style.transformOrigin = "top left";
-    cvs.style.minHeight = "800px";
+    cvsWrapper.style.width = (targetW * scale) + "px";
 
     if (useFixedSize) {
         cvs.style.height = targetH + "px";
         cvs.style.minHeight = targetH + "px";
-        cvsWrapper.style.width = (targetW * scale) + "px";
         cvsWrapper.style.height = (targetH * scale) + "px";
     } else {
+        // 和出图规则一致：自动高度时，画布至少拉长到按宽度等比铺开的背景图那么高
+        const size = hasImage && assetSize.get('background/' + bgName);
         cvs.style.height = "auto";
-        cvsWrapper.style.width = (targetW * scale) + "px";
+        cvs.style.minHeight = size ? Math.round(targetW * size.h / size.w) + "px" : "0";
         cvsWrapper.style.height = "auto";
     }
 
-    const bgType = m.bg_type || 'image';
     const bgFit = m.bg_fit_mode || 'cover';
     const alignX = m.bg_align_x || 'center';
     const alignY = m.bg_align_y || 'center';
-    const bgScale = parseFloat(m.video_scale !== undefined ? m.video_scale : 1.0);
     const userBgColor = m.canvas_color || '#1e1e1e';
+    const transformCSS = `scale(${m.video_scale ?? 1.0})`;
+    // 背景层在缩放后的包裹层里，自定义尺寸这类像素值要跟着画布一起缩
+    const customW = (m.bg_custom_width || 1000) * scale;
+    const customH = (m.bg_custom_height || 1000) * scale;
 
-    const transformCSS = `scale(${bgScale})`;
     cvs.style.backgroundImage = 'none';
-
-    const hasVideo = bgType === 'video' && m.bg_video;
-    const hasImage = bgType === 'image' && m.background;
+    cvs.style.backgroundColor = (hasVideo || hasImage) ? 'transparent' : userBgColor;
 
     bgPreviewLayer.style.display = (hasVideo || hasImage) ? 'flex' : 'none';
     bgPreviewLayer.style.flexDirection = 'column';
@@ -739,24 +839,20 @@ function renderCanvas(m) {
 
     const flexMapY = { 'top': 'flex-start', 'center': 'center', 'bottom': 'flex-end' };
     const flexMapX = { 'left': 'flex-start', 'center': 'center', 'right': 'flex-end' };
-
     bgPreviewLayer.style.justifyContent = flexMapY[alignY] || 'center';
     bgPreviewLayer.style.alignItems = flexMapX[alignX] || 'center';
-
-    if (hasVideo || hasImage) {
-        cvs.style.backgroundColor = 'transparent';
-    } else {
-        cvs.style.backgroundColor = userBgColor;
-    }
 
     if (hasVideo) {
         vidPreview.style.display = 'block';
         imgPreview.style.display = 'none';
 
-        const targetSrc = `${assetUrl('video', m.bg_video)}`;
-        if (!vidPreview.src.endsWith(encodeURI(m.bg_video))) {
-            vidPreview.src = targetSrc;
+        // 只在换了视频时才换 src，否则每次重绘都会让视频从头播放
+        const url = assetUrl('video', m.bg_video);
+        if (url !== BLANK_PX && vidPreview.dataset.src !== url) {
+            vidPreview.src = url;
+            vidPreview.dataset.src = url;
         }
+        if (vidPreview.paused && vidPreview.dataset.src) vidPreview.play().catch(() => {});
 
         vidPreview.style.transform = transformCSS;
         vidPreview.style.transformOrigin = 'center center';
@@ -776,17 +872,18 @@ function renderCanvas(m) {
                 vidPreview.style.width = 'auto';
                 vidPreview.style.height = '100%';
             } else if (bgFit === 'custom') {
-                vidPreview.style.width = (m.bg_custom_width || 1000) + 'px';
-                vidPreview.style.height = (m.bg_custom_height || 1000) + 'px';
+                vidPreview.style.width = customW + 'px';
+                vidPreview.style.height = customH + 'px';
             }
         }
-
-    } else if (hasImage) {
+    } else {
         vidPreview.style.display = 'none';
-        imgPreview.style.display = 'block';
+        if (!vidPreview.paused) vidPreview.pause();
+    }
 
-        const imgUrl = `url('${assetUrl('background', m.background)}')`;
-        imgPreview.style.backgroundImage = imgUrl;
+    if (hasImage) {
+        imgPreview.style.display = 'block';
+        imgPreview.style.backgroundImage = `url('${assetUrl('background', bgName)}')`;
         imgPreview.style.backgroundRepeat = 'no-repeat';
 
         imgPreview.style.backgroundPosition = `${alignX} ${alignY}`;
@@ -799,12 +896,15 @@ function renderCanvas(m) {
         else if (bgFit === 'contain') imgPreview.style.backgroundSize = 'contain';
         else if (bgFit === 'cover_w') imgPreview.style.backgroundSize = '100% auto';
         else if (bgFit === 'cover_h') imgPreview.style.backgroundSize = 'auto 100%';
-        else if (bgFit === 'custom') imgPreview.style.backgroundSize = `${m.bg_custom_width}px ${m.bg_custom_height}px`;
+        else if (bgFit === 'custom') imgPreview.style.backgroundSize = `${customW}px ${customH}px`;
+    } else {
+        imgPreview.style.display = 'none';
     }
 
+    // 缺省值与出图一致，免得拼出 "undefinedpx" 这种无效的 CSS
     let shadowCss = 'none';
     if (m.shadow_enabled) {
-        shadowCss = `${m.shadow_offset_x}px ${m.shadow_offset_y}px ${m.shadow_radius}px ${m.shadow_color}`;
+        shadowCss = `${m.shadow_offset_x ?? 2}px ${m.shadow_offset_y ?? 2}px ${m.shadow_radius ?? 2}px ${m.shadow_color || '#000000'}`;
     }
 
     // 主标题阴影
@@ -836,8 +936,8 @@ function renderCanvas(m) {
     let html = `
         <div class="header-area title-clickable" style="text-align:${titleAlign};"
              onclick="openContextEditor('title')">
-            <div style="color:${m.title_color}; font-family:'${gfTitle}'; font-size:${titleSz}px; text-shadow:${titleShadowCss}; ${getTextStyleCSS(m, 'title')}">${m.title}</div>
-            <div style="color:${m.subtitle_color}; font-family:'${gfSubtitle}'; font-size:${subSz}px; text-shadow:${subShadowCss}; ${getTextStyleCSS(m, 'subtitle')}">${m.sub_title}</div>
+            <div style="color:${m.title_color}; font-family:'${gfTitle}', sans-serif; font-size:${titleSz}px; text-shadow:${titleShadowCss}; ${getTextStyleCSS(m, 'title')}">${esc(m.title)}</div>
+            <div style="color:${m.subtitle_color}; font-family:'${gfSubtitle}', sans-serif; font-size:${subSz}px; text-shadow:${subShadowCss}; ${getTextStyleCSS(m, 'subtitle')}">${esc(m.sub_title)}</div>
         </div>
     `;
 
@@ -905,8 +1005,8 @@ function renderCanvas(m) {
         <div class="group-wrapper">
             <div class="group-header-wrap" onclick="openContextEditor('group', ${gIdx}, -1)"
                  style="padding:0 0 10px 10px; cursor:pointer; text-shadow:${gTitleShadowCss}; display:flex; gap:15px; align-items:${alignItems};">
-                <span style="color:${getStyle(g, 'title_color', 'group_title_color')}; font-family:'${gTitleFont}'; font-size:${gTitleSz}px; line-height:1; ${getTextStyleCSS(g, 'group_title')}">${g.title}</span>
-                ${g.subtitle ? `<span style="color:${gSubColor}; font-family:'${gSubFont}'; font-size:${gSubSz}px; line-height:1; text-shadow:${gSubShadowCss}; ${getTextStyleCSS(g, 'group_sub')}">${g.subtitle}</span>` : ''}
+                <span style="color:${getStyle(g, 'title_color', 'group_title_color')}; font-family:'${gTitleFont}', sans-serif; font-size:${gTitleSz}px; line-height:1; ${getTextStyleCSS(g, 'group_title')}">${esc(g.title)}</span>
+                ${(g.subtitle && !isTextGroup) ? `<span style="color:${gSubColor}; font-family:'${gSubFont}', sans-serif; font-size:${gSubSz}px; line-height:1; text-shadow:${gSubShadowCss}; ${getTextStyleCSS(g, 'group_sub')}">${esc(g.subtitle)}</span>` : ''}
             </div>`;
         
         // 纯文本分组
@@ -933,7 +1033,7 @@ function renderCanvas(m) {
             }
             
             html += `<div class="group-content-box" style="background-color:${bgRgba}; ${bgBlurCSS}; width:${groupWidth}; min-height:${groupHeight !== 'auto' ? groupHeight : 'auto'}; padding:20px; position:relative; border-radius:15px; word-wrap:break-word; white-space:pre-wrap; overflow-wrap:break-word;">
-                <div style="color:${textColor}; font-family:'${textFont}'; font-size:${textSize}px; line-height:1.6; text-shadow:${iTextShadowCss}; ${textStyleCSS}">${textContent}</div>
+                <div style="color:${textColor}; font-family:'${textFont}', sans-serif; font-size:${textSize}px; line-height:1.6; text-shadow:${iTextShadowCss}; ${textStyleCSS}">${esc(textContent)}</div>
             </div>`;
         } else {
             // 功能项分组
@@ -945,7 +1045,7 @@ function renderCanvas(m) {
                 const iBlur = iItemBlur > 0 ? `backdrop-filter: blur(${iItemBlur}px);` : '';
                 
                 const iRgba = hexToRgba(getStyle(item, 'bg_color', 'item_bg_color'), (item.bg_alpha !== undefined ? item.bg_alpha : m.item_bg_alpha) / 255);
-                const icon = item.icon ? `<img src="${assetUrl('icon', item.icon)}" class="item-icon" style="${item.icon_size ? `height:${item.icon_size}px` : ''}">` : '';
+                const icon = item.icon ? `<img ${assetImg('icon', item.icon)} class="item-icon" style="${item.icon_size ? `height:${item.icon_size}px` : ''}">` : '';
 
                 const iNameSz = getStyle(item, 'name_size', 'item_name_size') || 26;
                 const iDescSz = getStyle(item, 'desc_size', 'item_desc_size') || 16;
@@ -983,12 +1083,12 @@ function renderCanvas(m) {
                 else if (item.custom_height !== undefined) boxH = item.custom_height;
                 const fit = itemTextFit(boxH, iNameSz, iDescSz, !!item.desc);
                 const descHtml = fit.descLines > 0
-                    ? `<div style="color:${getStyle(item, 'desc_color', 'item_desc_color')};font-family:'${iDescFont}';font-size:${iDescSz}px;margin-top:5px;white-space:pre-wrap;text-shadow:${iDescShadowCss};${getTextStyleCSS(item, 'item_desc')}${lineClampCSS(fit.descLines)}">${item.desc}</div>`
+                    ? `<div style="color:${getStyle(item, 'desc_color', 'item_desc_color')};font-family:'${iDescFont}', sans-serif;font-size:${iDescSz}px;margin-top:5px;white-space:pre-wrap;text-shadow:${iDescShadowCss};${getTextStyleCSS(item, 'item_desc')}${lineClampCSS(fit.descLines)}">${esc(item.desc)}</div>`
                     : '';
 
                 const txt = `
                     <div class="item-text-content" style="text-shadow:${shadowCss};">
-                        <div style="color:${getStyle(item, 'name_color', 'item_name_color')};font-family:'${iNameFont}';font-size:${iNameSz}px;text-shadow:${iNameShadowCss};${getTextStyleCSS(item, 'item_name')}${lineClampCSS(fit.nameLines)}">${item.name}</div>
+                        <div style="color:${getStyle(item, 'name_color', 'item_name_color')};font-family:'${iNameFont}', sans-serif;font-size:${iNameSz}px;text-shadow:${iNameShadowCss};${getTextStyleCSS(item, 'item_name')}${lineClampCSS(fit.nameLines)}">${esc(item.name)}</div>
                         ${descHtml}
                     </div>`;
 
@@ -1013,6 +1113,8 @@ function renderCanvas(m) {
 
     cvs.innerHTML = html;
     renderWidgets(cvs, m, shadowCss);
+    // 字体到货后浏览器会自动重排，不用再重绘
+    menuFonts(m).forEach(loadFont);
 
     if (!useFixedSize) {
         requestAnimationFrame(() => {
@@ -1033,7 +1135,8 @@ function renderWidgets(container, m, shadowCss) {
 
         if (wid.type === 'image') {
             const imgUrl = wid.content ? `${assetUrl('widget', wid.content)}` : '';
-            el.innerHTML = imgUrl ? `<img src="${imgUrl}" style="width:100%;height:100%;object-fit:cover;pointer-events:none">` : `无图`;
+            // 出图时组件图是直接拉伸到设定宽高的，这里照实显示，别用 cover 裁出一张出图里不存在的效果
+            el.innerHTML = imgUrl ? `<img src="${imgUrl}" style="width:100%;height:100%;object-fit:fill;pointer-events:none">` : `无图`;
             el.style.width = (parseInt(wid.width)||100) + "px";
             el.style.height = (parseInt(wid.height)||100) + "px";
         } else {
@@ -1041,7 +1144,7 @@ function renderWidgets(container, m, shadowCss) {
             el.style.fontSize = (parseInt(wid.size)||40) + "px";
             el.style.color = wid.color || "#FFF";
             if (wid.font) {
-                el.style.fontFamily = `"${cssFont(wid.font)}"`;
+                el.style.fontFamily = `"${cssFont(wid.font)}", sans-serif`;
             }
             el.style.textShadow = shadowCss;
         }
@@ -1058,10 +1161,11 @@ function renderWidgets(container, m, shadowCss) {
 }
 
 function hexToRgba(hex, alpha) {
-    if (!hex) return `rgba(0,0,0,${alpha})`;
-    const r = parseInt(hex.slice(1, 3), 16),
-        g = parseInt(hex.slice(3, 5), 16),
-        b = parseInt(hex.slice(5, 7), 16);
+    let h = String(hex || '#000000').replace('#', '');
+    if (h.length === 3) h = h.split('').map(c => c + c).join('');   // 出图那边也认 #fff 这种简写
+    const r = parseInt(h.slice(0, 2), 16),
+        g = parseInt(h.slice(2, 4), 16),
+        b = parseInt(h.slice(4, 6), 16);
     return `rgba(${r},${g},${b},${alpha})`;
 }
 
@@ -1098,7 +1202,7 @@ function renderSidebarGroupList(m) {
             isTextGroup ? ' <span style="font-size:9px;background:#8b5cf6;padding:1px 3px;border-radius:2px;">纯文本</span>' : '',
             g.free_mode ? ' <span style="font-size:9px;background:#0e639c;padding:1px 3px;border-radius:2px;">自由</span>' : ''
         ].join('');
-        div.innerHTML = `<div style="flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;"><div style="font-weight:500;">${g.title}${badges}</div></div><div class="group-actions"><span class="icon-btn" onclick="addItem(${idx})">+</span><span class="icon-btn" onclick="moveGroup(${idx}, -1)">↑</span><span class="icon-btn" onclick="moveGroup(${idx}, 1)">↓</span></div>`;
+        div.innerHTML = `<div style="flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;"><div style="font-weight:500;">${esc(g.title)}${badges}</div></div><div class="group-actions">${isTextGroup ? '' : `<span class="icon-btn" onclick="addItem(${idx})">+</span>`}<span class="icon-btn" onclick="moveGroup(${idx}, -1)">↑</span><span class="icon-btn" onclick="moveGroup(${idx}, 1)">↓</span></div>`;
         div.firstElementChild.onclick = () => openContextEditor('group', idx, -1);
         list.appendChild(div);
     });
@@ -1136,11 +1240,13 @@ function addGroup() {
     renderAll();
 }
 
-function deleteGroup(idx) {
-    if (confirm("确定删除此分组？")) {
-        getCurrentMenu().groups.splice(idx, 1);
-        clearSelection();
-    }
+async function deleteGroup(idx) {
+    const g = getCurrentMenu().groups[idx];
+    const count = (g.items || []).length;
+    if (!await confirmBox(`确定删除分组「${g.title || '未命名'}」${count ? `及其中的 ${count} 个功能项` : ''}？`, '删除')) return;
+    getCurrentMenu().groups.splice(idx, 1);
+    clearSelection();
+    renderSidebarGroupList(getCurrentMenu());
 }
 
 function moveGroup(idx, dir) {
@@ -1164,7 +1270,7 @@ function updateWidget(key, val) {
     if (selectedWidgetIdx === -1) return;
     const m = getCurrentMenu();
     const w = m.custom_widgets[selectedWidgetIdx];
-    if (['size', 'width', 'height'].includes(key)) w[key] = parseInt(val);
+    if (['size', 'width', 'height'].includes(key)) setNumber(w, key, val);
     else w[key] = val;
     renderCanvas(m);
 }
@@ -1191,67 +1297,45 @@ function updateWidgetEditor(m) {
     }
 }
 
-function deleteWidget() {
+async function deleteWidget() {
     if (selectedWidgetIdx === -1) return;
-    if (confirm("删除组件?")) {
-        getCurrentMenu().custom_widgets.splice(selectedWidgetIdx, 1);
-        selectedWidgetIdx = -1;
-        renderAll();
-    }
+    if (!await confirmBox("确定删除这个装饰组件？", '删除')) return;
+    getCurrentMenu().custom_widgets.splice(selectedWidgetIdx, 1);
+    selectedWidgetIdx = -1;
+    renderAll();
 }
+
+const PROP_INT_KEYS = ['title_size', 'sub_size', 'name_size', 'desc_size', 'text_size', 'bg_alpha', 'layout_columns', 'item_height', 'width', 'height', 'x', 'y', 'w', 'h', 'group_blur_radius', 'item_blur_radius', 'canvas_width', 'canvas_height', 'icon_size', 'bg_custom_width', 'bg_custom_height', 'blur_radius', 'custom_width', 'custom_height', 'title_shadow_offset_x', 'title_shadow_offset_y', 'title_shadow_radius', 'subtitle_shadow_offset_x', 'subtitle_shadow_offset_y', 'subtitle_shadow_radius', 'group_title_shadow_offset_x', 'group_title_shadow_offset_y', 'group_title_shadow_radius', 'group_sub_shadow_offset_x', 'group_sub_shadow_offset_y', 'group_sub_shadow_radius', 'item_name_shadow_offset_x', 'item_name_shadow_offset_y', 'item_name_shadow_radius', 'item_desc_shadow_offset_x', 'item_desc_shadow_offset_y', 'item_desc_shadow_radius', 'text_shadow_offset_x', 'text_shadow_offset_y', 'text_shadow_radius', 'text_bg_alpha', 'text_bg_blur'];
 
 function updateProp(type, gIdx, iIdx, key, val) {
     const m = getCurrentMenu();
-    let obj;
-    if (type === 'title') { obj = m; }
-    else if (type === 'group') { obj = m.groups[gIdx]; }
-    else { obj = m.groups[gIdx].items[iIdx]; }
+    const obj = type === 'title' ? m : type === 'group' ? m.groups[gIdx] : m.groups[gIdx].items[iIdx];
 
-    if (val === "") {
-        delete obj[key];
-    } else {
-        if (['title_size', 'sub_size', 'name_size', 'desc_size', 'text_size', 'bg_alpha', 'layout_columns', 'item_height', 'width', 'height', 'x', 'y', 'w', 'h', 'group_blur_radius', 'item_blur_radius', 'canvas_width', 'canvas_height', 'icon_size', 'bg_custom_width', 'bg_custom_height', 'blur_radius', 'custom_width', 'custom_height', 'title_shadow_offset_x', 'title_shadow_offset_y', 'title_shadow_radius', 'subtitle_shadow_offset_x', 'subtitle_shadow_offset_y', 'subtitle_shadow_radius', 'group_title_shadow_offset_x', 'group_title_shadow_offset_y', 'group_title_shadow_radius', 'group_sub_shadow_offset_x', 'group_sub_shadow_offset_y', 'group_sub_shadow_radius', 'item_name_shadow_offset_x', 'item_name_shadow_offset_y', 'item_name_shadow_radius', 'item_desc_shadow_offset_x', 'item_desc_shadow_offset_y', 'item_desc_shadow_radius', 'text_shadow_offset_x', 'text_shadow_offset_y', 'text_shadow_radius', 'text_bg_alpha', 'text_bg_blur'].includes(key)) {
-            val = parseInt(val);
-        }
-        if (key.endsWith('_enabled') || key.endsWith('_bold') || key.endsWith('_italic') || key.endsWith('_underline')) {
-            val = val === true || val === 'true';
-        }
-        obj[key] = val;
-    }
+    if (val === "" || val === undefined) delete obj[key];
+    else if (PROP_INT_KEYS.includes(key)) setNumber(obj, key, val);
+    else if (/_(enabled|bold|italic|underline)$/.test(key)) obj[key] = val === true || val === 'true';
+    else obj[key] = val;
 
-    if (key === 'icon') {
-        openContextEditor(type, gIdx, iIdx);
-    } else if (key === 'group_type') {
-        // 当改变分组类型时，刷新编辑面板以显示/隐藏相关字段
+    if (key === 'icon' || key === 'group_type') {
+        // 换图标 / 换分组类型时编辑面板里的字段也跟着变，整个重建
         renderCanvas(m);
         openContextEditor(type, gIdx, iIdx);
     } else {
         renderCanvas(m);
     }
+    if (type === 'group') renderSidebarGroupList(m);
 }
 
-function deleteCurrentItemProp(gIdx, iIdx) {
-    if (confirm("确定删除此项？")) {
-        getCurrentMenu().groups[gIdx].items.splice(iIdx, 1);
-        clearSelection();
-    }
+async function deleteCurrentItemProp(gIdx, iIdx) {
+    const item = getCurrentMenu().groups[gIdx].items[iIdx];
+    if (!await confirmBox(`确定删除功能项「${item.name || '未命名'}」？`, '删除')) return;
+    getCurrentMenu().groups[gIdx].items.splice(iIdx, 1);
+    clearSelection();
 }
 
-async function initFonts() {
-    // 字体要先取回来变成 blob URL，@font-face 才能引用
-    for (const n of (appState.assets.fonts || [])) {
-        const id = "f-" + n;
-        if (document.getElementById(id)) continue;
-        const url = await fetchAsset('font', n);
-        if (url === BLANK_PX) continue;
-        const s = document.createElement("style");
-        s.id = id;
-        s.textContent = `@font-face { font-family: '${cssFont(n)}'; src: url('${url}'); }`;
-        document.head.appendChild(s);
-    }
-    scheduleAssetRerender();
-}
-function cssFont(n) { return n ? n.replace(/[^a-zA-Z0-9_]/g, '_') : 'sans-serif'; }
+// 字体文件名转成 font-family。非 ASCII 字符按码位编码，
+// 否则「字魂.ttf」「站酷.ttf」这类同长度的中文名会撞成同一个名字
+function cssFont(n) { return n ? 'f_' + n.replace(/[^a-zA-Z0-9]/g, c => '_' + c.codePointAt(0).toString(16)) : 'sans-serif'; }
 
 async function openAutoFillModal() {
     const modal = document.getElementById('autoFillModal');
@@ -1363,7 +1447,7 @@ function confirmAutoFill() {
     });
 
     if (selectedData.length === 0) {
-        alert("请先选择要导入的指令！");
+        toast("请先勾选要导入的指令", 'warn');
         return;
     }
 
@@ -1399,7 +1483,7 @@ function confirmAutoFill() {
 
     document.getElementById('autoFillModal').style.display='none';
     renderAll();
-    alert(`✅ 已成功导入 ${addedCount} 个指令到新分组！`);
+    toast(`✅ 已导入 ${addedCount} 个指令到新分组`);
 }
 
 function clearSelection() {
@@ -1462,14 +1546,14 @@ function generatePropForm(type, obj, gIdx, iIdx) {
     const input = (label, key, val, itype='text', extra='') => `
         <div class="form-row">
             <label>${label}</label>
-            <input type="${itype}" value="${val !== undefined && val !== null ? val : ''}" class="form-control"
+            <input type="${itype}" value="${esc(val)}" class="form-control"
                 oninput="updateProp('${type}', ${gIdx}, ${iIdx}, '${key}', this.value)" ${extra}>
         </div>`;
     const textarea = (label, key, val) => `
         <div class="form-row">
             <label>${label}</label>
             <textarea class="form-control" style="height: 80px; resize: vertical;"
-                oninput="updateProp('${type}', ${gIdx}, ${iIdx}, '${key}', this.value)">${val || ''}</textarea>
+                oninput="updateProp('${type}', ${gIdx}, ${iIdx}, '${key}', this.value)">${esc(val)}</textarea>
         </div>`;
     const color = (label, key, globalKey) => {
         const val = obj[key] || "";
@@ -1671,15 +1755,15 @@ function generatePropForm(type, obj, gIdx, iIdx) {
 
         // 图标选择器 - 使用全局函数调用
         const iconPreview = obj.icon ? 
-            `<img src="${assetUrl('icon', obj.icon, true)}" style="width:32px;height:32px;object-fit:cover;border-radius:4px;border:1px solid #555;">` :
+            `<img ${assetImg('icon', obj.icon, true)} style="width:32px;height:32px;object-fit:cover;border-radius:4px;border:1px solid #555;">` :
             `<div style="width:32px;height:32px;background:#333;border-radius:4px;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;border:1px solid #555;">无</div>`;
         html += `
         <div class="form-row">
             <label>图标</label>
             <div style="display:flex; gap:5px; align-items:center;">
-                <div style="flex:1;display:flex;align-items:center;gap:8px;cursor:pointer;padding:5px;background:#2a2a2a;border-radius:4px;border:1px solid #444;" onclick="openIconPicker(${gIdx}, ${iIdx}, '${obj.icon || ''}')">
+                <div style="flex:1;display:flex;align-items:center;gap:8px;cursor:pointer;padding:5px;background:#2a2a2a;border-radius:4px;border:1px solid #444;" onclick="openIconPicker(${gIdx}, ${iIdx})">
                     ${iconPreview}
-                    <span style="flex:1;font-size:12px;color:#ccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${obj.icon || '点击选择...'}</span>
+                    <span style="flex:1;font-size:12px;color:#ccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(obj.icon || '点击选择...')}</span>
                     <span style="color:#888;font-size:14px;">▼</span>
                 </div>
                 <button class="btn btn-secondary" onclick="document.getElementById('itemIconUp').click()" title="上传新图标">⬆</button>
@@ -1897,15 +1981,22 @@ function handleGlobalMouseUp(e) {
     dragData.currentH = undefined;
 }
 
+function isTyping() {
+    const el = document.activeElement;
+    return !!el && (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) || el.isContentEditable);
+}
+
 function handleKeyDown(e) {
+    // 有弹窗开着时不响应画布快捷键
+    if (document.querySelector('.modal-overlay[style*="flex"]')) return;
     if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
+        if (isTyping()) return;
 
         if (selectedWidgetIdx !== -1) deleteWidget();
         else if (selectedItem.gIdx !== -1) deleteCurrentItemProp(selectedItem.gIdx, selectedItem.iIdx);
     }
     if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) {
-        if (['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
+        if (isTyping()) return;
         e.preventDefault();
 
         const m = getCurrentMenu();
@@ -1931,205 +2022,127 @@ function handleKeyDown(e) {
 }
 
 // =============================================================
-//  通用图片选择器（完全模仿随机背景逻辑）
+//  通用图片选择器
 // =============================================================
 
-let imagePickerCallback = null;
-let imagePickerCurrentValue = '';
-let imagePickerImages = [];  // 缓存当前图片列表
-let imagePickerBasePath = '';  // 缓存当前路径
-let imagePickerType = '';  // 缓存当前资源类型 (background, icon, widget, font, video)
+const PICKER_TYPES = {
+    background: { list: 'backgrounds', title: '选择背景图片' },
+    icon: { list: 'icons', title: '选择图标' },
+    widget: { list: 'widget_imgs', title: '选择组件图片' },
+};
+
+let imagePicker = { type: '', current: '', callback: null };
 
 function openImagePicker(type, currentValue, callback) {
-    imagePickerCallback = callback;
-    imagePickerCurrentValue = currentValue;
-    imagePickerType = type;  // 保存资源类型
-    
-    let images = [];
-    let basePath = '';
-    let title = '选择图片';
-    
-    if (type === 'background') {
-        images = appState.assets.backgrounds || [];
-        basePath = '/raw_assets/backgrounds/';
-        title = '选择背景图片';
-    } else if (type === 'icon') {
-        images = appState.assets.icons || [];
-        basePath = '/raw_assets/icons/';
-        title = '选择图标';
-    } else if (type === 'widget') {
-        images = appState.assets.widget_imgs || [];
-        basePath = '/raw_assets/widgets/';
-        title = '选择组件图片';
-    }
-    
-    // 缓存用于搜索
-    imagePickerImages = images;
-    imagePickerBasePath = basePath;
-    
-    const modal = document.getElementById('imagePickerModal');
-    const container = document.getElementById('imagePickerGrid');
-    const titleEl = document.getElementById('imagePickerTitle');
-    const searchInput = document.getElementById('imagePickerSearch');
-    
-    titleEl.innerText = title;
-    if (searchInput) searchInput.value = '';  // 清空搜索框
-    
-    // 渲染图片列表
-    renderImagePickerGrid(images, basePath, currentValue);
-    
-    modal.style.display = 'flex';
+    imagePicker = { type, current: currentValue || '', callback };
+    document.getElementById('imagePickerTitle').innerText = PICKER_TYPES[type].title;
+    document.getElementById('imagePickerSearch').value = '';
+    renderImagePickerGrid('');
+    document.getElementById('imagePickerModal').style.display = 'flex';
 }
 
-function renderImagePickerGrid(images, basePath, currentValue) {
+function renderImagePickerGrid(keyword) {
     const container = document.getElementById('imagePickerGrid');
+    const all = appState.assets[PICKER_TYPES[imagePicker.type].list] || [];
+    const kw = (keyword || '').trim().toLowerCase();
+    const images = kw ? all.filter(n => n.toLowerCase().includes(kw)) : all;
     container.innerHTML = '';
-    
-    if (images.length === 0 && imagePickerImages.length === 0) {
+
+    if (all.length === 0) {
         container.innerHTML = '<div style="color:#888; text-align:center; grid-column:1/-1; padding:40px;">暂无图片，请先上传</div>';
         return;
     }
-    
-    // 添加"无"选项（只在未搜索或搜索为空时显示）
-    const noneItem = document.createElement('div');
-    noneItem.className = 'image-picker-item' + (!currentValue ? ' selected' : '');
-    noneItem.innerHTML = `
-        <div style="width:80px;height:80px;display:flex;align-items:center;justify-content:center;background:#333;border-radius:4px;color:#666;font-size:24px;">✕</div>
-        <span>无</span>
-    `;
-    noneItem.onclick = function() { doSelectImage(''); };
-    container.appendChild(noneItem);
-    
+
+    const none = document.createElement('div');
+    none.className = 'image-picker-item' + (!imagePicker.current ? ' selected' : '');
+    none.innerHTML = '<div class="picker-none">✕</div><span>无</span>';
+    none.onclick = () => doSelectImage('');
+    container.appendChild(none);
+
     if (images.length === 0) {
-        const noResult = document.createElement('div');
-        noResult.style.cssText = 'color:#888; text-align:center; grid-column:1/-1; padding:20px;';
-        noResult.innerText = '没有匹配的图片';
-        container.appendChild(noResult);
+        container.insertAdjacentHTML('beforeend', '<div style="color:#888; text-align:center; grid-column:1/-1; padding:20px;">没有匹配的图片</div>');
         return;
     }
-    
-    // 添加所有图片选项
-    images.forEach(function(img) {
-        const isSelected = img === currentValue;
+
+    images.forEach(name => {
         const item = document.createElement('div');
-        item.className = 'image-picker-item' + (isSelected ? ' selected' : '');
-        item.style.position = 'relative';
-        
-        const imgHtml = `
-            <img src="${pathAssetUrl(basePath, img, true)}" style="width:80px;height:80px;object-fit:cover;border-radius:4px;">
-            <span style="max-width:90px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block;" title="${img}">${img}</span>
-        `;
-        
-        // 添加操作按钮
-        const actionButtons = `
-            <div style="position:absolute;top:0;right:0;background:rgba(0,0,0,0.7);border-radius:0 4px;padding:2px;display:flex;gap:2px;opacity:0;transition:opacity 0.3s;" class="asset-actions">
-                <button class="btn btn-xs" style="padding:2px 4px;font-size:10px;color:#fff;" onclick="downloadAsset('${imagePickerType}', '${img.replace(/'/g, "\\'")}'); return false;" title="下载">📥</button>
-                <button class="btn btn-xs btn-danger" style="padding:2px 4px;font-size:10px;color:#fff;" onclick="deleteAssetAndRefresh('${imagePickerType}', '${img.replace(/'/g, "\\'")}'); return false;" title="删除">🗑</button>
-            </div>
-        `;
-        
-        item.innerHTML = imgHtml + actionButtons;
-        item.style.cursor = 'pointer';
-        
-        // 添加鼠标事件
-        item.onmouseenter = function() {
-            this.querySelector('.asset-actions').style.opacity = '1';
-        };
-        item.onmouseleave = function() {
-            this.querySelector('.asset-actions').style.opacity = '0';
-        };
-        
-        // 点击选择
-        item.querySelector('img').parentElement.onclick = function(e) {
-            if (!e.target.closest('.asset-actions')) {
-                doSelectImage(img);
-            }
-        };
-        
+        item.className = 'image-picker-item' + (name === imagePicker.current ? ' selected' : '');
+        item.title = name;
+        item.innerHTML = `
+            <img ${assetImg(imagePicker.type, name, true)}>
+            <span>${esc(name)}</span>
+            <div class="asset-actions">
+                <button class="btn btn-xs" title="下载">📥</button>
+                <button class="btn btn-xs btn-danger" title="删除">🗑</button>
+            </div>`;
+        const [dl, del] = item.querySelectorAll('.asset-actions button');
+        dl.onclick = (e) => { e.stopPropagation(); downloadAsset(imagePicker.type, name); };
+        del.onclick = (e) => { e.stopPropagation(); deleteAssetAndRefresh(imagePicker.type, name); };
+        item.onclick = () => doSelectImage(name);
         container.appendChild(item);
     });
 }
 
 function filterImagePicker(keyword) {
-    const kw = keyword.trim().toLowerCase();
-    if (!kw) {
-        // 空搜索，显示全部
-        renderImagePickerGrid(imagePickerImages, imagePickerBasePath, imagePickerCurrentValue);
-        return;
-    }
-    // 过滤匹配的图片
-    const filtered = imagePickerImages.filter(function(img) {
-        return img.toLowerCase().indexOf(kw) !== -1;
-    });
-    renderImagePickerGrid(filtered, imagePickerBasePath, imagePickerCurrentValue);
+    renderImagePickerGrid(keyword);
 }
 
 function doSelectImage(value) {
-    if (imagePickerCallback) {
-        imagePickerCallback(value);
-    }
-    document.getElementById('imagePickerModal').style.display = 'none';
-    imagePickerCallback = null;
+    const callback = imagePicker.callback;
+    closeImagePicker();
+    if (callback) callback(value);
 }
 
 function closeImagePicker() {
     document.getElementById('imagePickerModal').style.display = 'none';
-    imagePickerCallback = null;
+    imagePicker.callback = null;
 }
 
-async function downloadAsset(type, filename) {
+async function downloadAsset(kind, name) {
     try {
-        const response = await api("/download_asset", "POST", { type, filename });
-        // 下载文件
-        const url = window.URL.createObjectURL(response);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        window.URL.revokeObjectURL(url);
+        const sdk = await bridge();
+        await sdk.download('asset/download', { kind, name }, name);
     } catch (e) {
-        alert("❌ 下载失败: " + e);
+        toast("❌ 下载失败：" + errMsg(e), 'error', 6000);
     }
 }
 
-async function deleteAssetAndRefresh(type, filename) {
-    if (!confirm(`确定要删除文件 "${filename}" 吗？此操作不可逆。`)) return;
-    
+// 还在用这个素材的菜单，删除前提醒一句
+function assetUsers(kind, name) {
+    return appState.fullConfig.menus.filter(m => {
+        if (kind === 'background') return m.background === name || (m.backgrounds || []).includes(name);
+        if (kind === 'icon') return (m.groups || []).some(g => (g.items || []).some(i => i.icon === name));
+        if (kind === 'widget') return (m.custom_widgets || []).some(w => w.type === 'image' && w.content === name);
+        return false;
+    }).map(m => m.name);
+}
+
+async function deleteAssetAndRefresh(kind, name) {
+    const users = assetUsers(kind, name);
+    const warn = users.length ? `\n\n「${users.join('」「')}」还在用它，删掉后那里会变成空白。` : '';
+    if (!await confirmBox(`确定删除素材「${name}」？此操作不可撤销。${warn}`, '删除')) return;
+
     try {
-        await api("/delete_asset", "POST", { type, filename });
-        alert("✅ 文件已删除");
-        await loadAssets();
-        initFonts();
-        renderAll();
-        // 重新打开图片选择器
-        if (imagePickerType) {
-            openImagePicker(imagePickerType, imagePickerCurrentValue, imagePickerCallback);
+        await api("/asset/delete", "POST", { kind, name });
+        for (const key of [`${kind}/${name}`, `${kind}/${name}#t`]) {
+            const url = assetCache.get(key);
+            if (url && url.startsWith('blob:')) URL.revokeObjectURL(url);
+            assetCache.delete(key);
         }
+        await loadAssets();
+        renderAll();
+        if (document.getElementById('imagePickerModal').style.display === 'flex') {
+            renderImagePickerGrid(document.getElementById('imagePickerSearch').value);
+        }
+        toast("✅ 已删除 " + name);
     } catch (e) {
-        alert("❌ 删除失败: " + e);
+        toast("❌ 删除失败：" + errMsg(e), 'error', 6000);
     }
 }
 
-// 专用选择器函数（用于 HTML onclick 调用）
-function openIconPicker(gIdx, iIdx, currentIcon) {
-    openImagePicker('icon', currentIcon, function(v) {
-        updateProp('item', gIdx, iIdx, 'icon', v);
-        openContextEditor('item', gIdx, iIdx);
-    });
-}
-
-function openBgPicker(currentBg) {
-    openImagePicker('background', currentBg, function(v) {
-        updateBg(v);
-    });
-}
-
-function openWidgetImgPicker(currentImg) {
-    openImagePicker('widget', currentImg, function(v) {
-        updateWidget('content', v);
-    });
+function openIconPicker(gIdx, iIdx) {
+    const item = getCurrentMenu().groups[gIdx].items[iIdx];
+    openImagePicker('icon', item.icon || '', v => updateProp('item', gIdx, iIdx, 'icon', v));
 }
 
 // =============================================================
@@ -2139,53 +2152,16 @@ function renderImageSelect(containerId, type, currentValue, onChangeCallback) {
     const container = document.getElementById(containerId);
     if (!container) return;
 
-    let basePath = '';
-    if (type === 'background') basePath = '/raw_assets/backgrounds/';
-    else if (type === 'icon') basePath = '/raw_assets/icons/';
-    else if (type === 'widget') basePath = '/raw_assets/widgets/';
-
-    container.innerHTML = '';
-
-    const wrapper = document.createElement('div');
-    // 添加 max-width: 100% 防止父级溢出
-    wrapper.style.cssText = 'display:flex;align-items:center;gap:8px;cursor:pointer;padding:5px;background:#2a2a2a;border-radius:4px;border:1px solid #444;max-width:220px;width:auto;min-width:0;box-sizing:border-box;';
-
-    // 预览图
-    if (currentValue) {
-        const img = document.createElement('img');
-        img.src = pathAssetUrl(basePath, currentValue, true);
-        // 保持预览图不被压缩
-        img.style.cssText = 'width:32px;height:32px;min-width:32px;object-fit:cover;border-radius:4px;border:1px solid #555;';
-        wrapper.appendChild(img);
-    } else {
-        const placeholder = document.createElement('div');
-        placeholder.style.cssText = 'width:32px;height:32px;min-width:32px;background:#333;border-radius:4px;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;border:1px solid #555;';
-        placeholder.innerText = '无';
-        wrapper.appendChild(placeholder);
-    }
-
-    // 文本
-    const text = document.createElement('span');
-    text.style.cssText = 'flex:1 1 auto;min-width:0;max-width:100%;font-size:12px;color:#ccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
-    text.innerText = currentValue || '点击选择...';
-    // 添加 title 属性，鼠标悬停时可以看到完整文件名
-    text.title = currentValue || '';
-    wrapper.appendChild(text);
-
-    // 箭头
-    const arrow = document.createElement('span');
-    arrow.style.cssText = 'color:#888;font-size:14px;flex-shrink:0;';
-    arrow.innerText = '▼';
-    wrapper.appendChild(arrow);
-
-    // 点击打开选择器
-    wrapper.onclick = function() {
-        openImagePicker(type, currentValue || '', function(selectedValue) {
-            onChangeCallback(selectedValue);
-        });
-    };
-
-    container.appendChild(wrapper);
+    const preview = currentValue
+        ? `<img ${assetImg(type, currentValue, true)} class="select-preview-img">`
+        : '<div class="select-preview-img select-preview-none">无</div>';
+    container.innerHTML = `
+        <div class="image-select">
+            ${preview}
+            <span class="image-select-name" title="${esc(currentValue)}">${esc(currentValue || '点击选择...')}</span>
+            <span style="color:#888;font-size:14px;flex-shrink:0;">▼</span>
+        </div>`;
+    container.firstElementChild.onclick = () => openImagePicker(type, currentValue || '', onChangeCallback);
 }
 
 
@@ -2197,66 +2173,68 @@ function openRandomBgModal() {
     const m = getCurrentMenu();
     const bgList = appState.assets.backgrounds || [];
     const selectedBgs = m.backgrounds || [];
-    
+
     const container = document.getElementById('randomBgCheckList');
     container.innerHTML = '';
-    
+
     if (bgList.length === 0) {
         container.innerHTML = '<div style="color:#888; text-align:center; grid-column:1/-1;">暂无背景图片，请先上传</div>';
         document.getElementById('randomBgModal').style.display = 'flex';
         return;
     }
-    
+
     bgList.forEach(bg => {
-        const isChecked = selectedBgs.includes(bg);
-        const item = document.createElement('div');
-        item.style.cssText = 'display:flex; align-items:center; gap:8px; padding:5px; background:#333; border-radius:4px;';
+        const item = document.createElement('label');
+        item.style.cssText = 'display:flex; align-items:center; gap:8px; padding:5px; background:#333; border-radius:4px; cursor:pointer;';
         item.innerHTML = `
-            <input type="checkbox" class="random-bg-check" value="${bg}" ${isChecked ? 'checked' : ''} style="width:16px;height:16px;">
-            <img src="${assetUrl('background', bg, true)}" style="width:40px;height:40px;object-fit:cover;border-radius:4px;">
-            <span style="font-size:11px;color:#ccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;" title="${bg}">${bg}</span>
+            <input type="checkbox" class="random-bg-check" value="${esc(bg)}" ${selectedBgs.includes(bg) ? 'checked' : ''} style="width:16px;height:16px;">
+            <img ${assetImg('background', bg, true)} style="width:40px;height:40px;object-fit:cover;border-radius:4px;">
+            <span style="font-size:11px;color:#ccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;" title="${esc(bg)}">${esc(bg)}</span>
         `;
         container.appendChild(item);
     });
-    
+
     document.getElementById('randomBgModal').style.display = 'flex';
 }
 
 function confirmRandomBgSelection() {
     const m = getCurrentMenu();
-    const checks = document.querySelectorAll('.random-bg-check:checked');
-    const selected = Array.from(checks).map(c => c.value);
-    
-    m.backgrounds = selected;
-    
-    // 更新显示
-    renderRandomBgList();
+    m.backgrounds = Array.from(document.querySelectorAll('.random-bg-check:checked')).map(c => c.value);
     document.getElementById('randomBgModal').style.display = 'none';
+    renderRandomBgList();
+    renderCanvas(m);   // 画布预览的背景可能跟着变
 }
 
 function renderRandomBgList() {
     const m = getCurrentMenu();
     const container = document.getElementById('randomBgList');
     if (!container) return;
-    
+
     const bgList = m.backgrounds || [];
-    
+    const hint = document.getElementById('randomBgHint');
+    if (hint) hint.style.display = bgList.length ? 'block' : 'none';
+
     if (bgList.length === 0) {
         container.innerHTML = '<div style="color:#666; font-size:11px; text-align:center;">未配置随机背景</div>';
         return;
     }
-    
-    container.innerHTML = bgList.map(bg => `
-        <div style="display:inline-flex; align-items:center; gap:4px; margin:2px; padding:3px 6px; background:#333; border-radius:4px; font-size:10px;">
-            <img src="${assetUrl('background', bg, true)}" style="width:20px;height:20px;object-fit:cover;border-radius:2px;">
-            <span style="max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${bg}">${bg}</span>
-            <span style="cursor:pointer;color:#f56c6c;" onclick="removeRandomBg('${bg}')">&times;</span>
-        </div>
-    `).join('');
+
+    container.innerHTML = '';
+    bgList.forEach((bg, idx) => {
+        const chip = document.createElement('div');
+        chip.className = 'random-bg-chip';
+        chip.innerHTML = `
+            <img ${assetImg('background', bg, true)}>
+            <span title="${esc(bg)}">${esc(bg)}</span>
+            <span class="chip-x" title="移出随机列表">&times;</span>`;
+        chip.querySelector('.chip-x').onclick = () => removeRandomBg(idx);
+        container.appendChild(chip);
+    });
 }
 
-function removeRandomBg(bgName) {
+function removeRandomBg(idx) {
     const m = getCurrentMenu();
-    m.backgrounds = (m.backgrounds || []).filter(b => b !== bgName);
+    m.backgrounds = (m.backgrounds || []).filter((_, i) => i !== idx);
     renderRandomBgList();
+    renderCanvas(m);
 }

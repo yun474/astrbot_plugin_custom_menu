@@ -1,3 +1,4 @@
+import random
 import re
 import traceback
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -23,6 +24,31 @@ BASE_ITEM_GAP_Y = 15
 
 # 自带的中文字体，用作找不到指定字体时的回退，避免整屏方框
 _FALLBACK_FONTS = ("text.ttf", "title.ttf")
+
+
+def drop_nulls(value):
+    """去掉值为 null 的字段，让各处的 .get(key, 默认值) 正常回落。
+
+    编辑器里清空数字输入框会得到 NaN，JSON 序列化后就是 null。
+    直接 int(None) 的话，背景会被悄悄跳过，阴影偏移之类的更会让整张图渲染失败。
+    """
+    if isinstance(value, dict):
+        return {k: drop_nulls(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [drop_nulls(v) for v in value if v is not None]
+    return value
+
+
+def pick_background(menu_data: dict) -> str:
+    """配了随机背景就从里面挑一张（这时单张背景不生效），否则用单张背景。"""
+    pool = [b for b in menu_data.get("backgrounds") or [] if b]
+    return random.choice(pool) if pool else (menu_data.get("background") or "")
+
+
+def _open_rgba(path) -> Image.Image:
+    """读成 RGBA 并立即释放文件句柄，否则 Windows 上素材会被占用、删不掉。"""
+    with Image.open(path) as img:
+        return img.convert("RGBA")
 
 
 def load_font(font_name: str, size: int) -> ImageFont.FreeTypeFont:
@@ -284,18 +310,18 @@ def render_item_content(overlay_img, draw, item, box, fonts_map, shadow_cfg, men
         icon_path = plugin_storage.icon_dir / icon_name
         if icon_path.exists():
             try:
-                with Image.open(icon_path).convert("RGBA") as icon_img:
-                    custom_icon_size = item.get("icon_size")
-                    target_h = int(int(custom_icon_size) * scale) if custom_icon_size and int(
-                        custom_icon_size) > 0 else int(h * 0.6)
-                    target_h = max(1, min(target_h, h - int(4 * scale)))
-                    aspect_ratio = icon_img.width / icon_img.height if icon_img.height > 0 else 1
-                    target_w = int(target_h * aspect_ratio)
-                    icon_resized = icon_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-                    icon_x, icon_y = x + int(15 * scale), y + (h - icon_resized.height) // 2
-                    overlay_img.paste(icon_resized, (icon_x, icon_y), icon_resized)
-                    text_start_x = icon_x + icon_resized.width + int(12 * scale)
-                    text_max_width = x2 - text_start_x - int(15 * scale)  # 更新文本最大宽度
+                icon_img = _open_rgba(icon_path)
+                custom_icon_size = item.get("icon_size")
+                target_h = int(int(custom_icon_size) * scale) if custom_icon_size and int(
+                    custom_icon_size) > 0 else int(h * 0.6)
+                target_h = max(1, min(target_h, h - int(4 * scale)))
+                aspect_ratio = icon_img.width / icon_img.height if icon_img.height > 0 else 1
+                target_w = int(target_h * aspect_ratio)
+                icon_resized = icon_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                icon_x, icon_y = x + int(15 * scale), y + (h - icon_resized.height) // 2
+                overlay_img.paste(icon_resized, (icon_x, icon_y), icon_resized)
+                text_start_x = icon_x + icon_resized.width + int(12 * scale)
+                text_max_width = x2 - text_start_x - int(15 * scale)  # 更新文本最大宽度
             except:
                 pass
 
@@ -332,6 +358,23 @@ def render_item_content(overlay_img, draw, item, box, fonts_map, shadow_cfg, men
                               scale=scale, text_styles=name_styles)
     if desc: draw_text_with_shadow(draw, (text_start_x, text_start_y + name_h + gap), desc, desc_font,
                                    fonts_map["desc_color"], desc_shadow, spacing=line_spacing, scale=scale, text_styles=desc_styles)
+
+
+def _text_group_block(group: dict, menu_data: dict, scale: float, max_w: int, draw):
+    """纯文本分组的字体和折好行的正文。量高度和实际绘制都走这里，保证两边一致。"""
+    size = int(group.get("text_size") or menu_data.get("group_sub_size") or 30)
+    font = load_font(group.get("text_font") or menu_data.get("group_sub_font", "text.ttf"), int(size * scale))
+    text = group.get("text_content") or group.get("subtitle") or ""
+    if text and max_w > 0:
+        text = wrap_text_to_width(text, font, max_w, draw)
+    return font, text
+
+
+def _text_block_height(draw, text: str, font) -> int:
+    """按 multiline_text 的实际排版量出文字块从起点到底部的高度。"""
+    if not text:
+        return 0
+    return int(draw.multiline_textbbox((0, 0), text, font=font, spacing=4)[3])
 
 
 def get_style(obj: dict, menu: dict, key: str, fallback_key: str, default=None):
@@ -477,7 +520,11 @@ def grid_item_box(slot, origin_x: int, origin_y: int, cell_w: int, row_h: int,
     return x, y, cell_w, half_h
 
 
-def _render_layout(menu_data: dict, is_video_mode: bool) -> Image.Image:
+def _render_layout(menu_data: dict, bg_name: str = "") -> Image.Image:
+    """画出背景以外的全部内容。
+
+    bg_name 是这次实际要用的背景图：自动高度模式下画布至少要拉到能完整显示它。
+    """
     scale = float(menu_data.get("export_scale", 1.0))
     if scale <= 0: scale = 1.0
 
@@ -506,7 +553,9 @@ def _render_layout(menu_data: dict, is_video_mode: bool) -> Image.Image:
     }
 
     title_size = s(int(menu_data.get("title_size") or 60))
-    header_height = TITLE_TOP_MARGIN + title_size + s(10) + int(title_size * 0.5) + s(30)
+    # 副标题字号编辑器里能单独设，没设才是主标题的一半
+    subtitle_size = s(int(menu_data["subtitle_size"])) if menu_data.get("subtitle_size") else int(title_size * 0.5)
+    header_height = TITLE_TOP_MARGIN + title_size + s(10) + subtitle_size + s(30)
     current_y, group_layout_info = header_height, []
     blur_regions = []  # 收集所有需要磨砂的区域
 
@@ -526,18 +575,11 @@ def _render_layout(menu_data: dict, is_video_mode: bool) -> Image.Image:
             box_start_y = current_y + g_title_size + s(20)
         
         if is_text_group:
-            # 纯文本分组 - 自适应高度
-            text_content = group.get("text_content", "")
-            gsf = load_font(get_style(group, menu_data, 'sub_font', 'group_sub_font', 'text.ttf'),
-                           s(int(get_style(group, menu_data, 'sub_size', 'group_sub_size', 18))))
-            temp_draw = ImageDraw.Draw(Image.new("RGBA", (final_w - PADDING_X * 2, 1)))
-            
-            if hasattr(temp_draw, "multiline_textbbox"):
-                bbox = temp_draw.multiline_textbbox((0, 0), text_content, font=gsf, spacing=4)
-                content_h = bbox[3] - bbox[1] + s(40)
-            else:
-                _, text_h = temp_draw.multiline_textsize(text_content, font=gsf, spacing=4)
-                content_h = text_h + s(40)
+            # 纯文本分组 - 自适应高度；和绘制用同一套字体和折行，否则文字会溢出分组框
+            temp_draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+            text_w = final_w - PADDING_X * 2 - s(40)
+            text_font, text_content = _text_group_block(group, menu_data, scale, text_w, temp_draw)
+            content_h = _text_block_height(temp_draw, text_content, text_font) + s(40)
         elif is_free:
             max_bottom = max((s(int(item.get("y", 0))) + s(int(item.get("h", 100))) for item in items), default=0)
             content_h = max(s(int(group.get("min_height", 100))), max_bottom + s(20))
@@ -559,7 +601,7 @@ def _render_layout(menu_data: dict, is_video_mode: bool) -> Image.Image:
     else:
         final_h = content_final_h
         bg_aspect_h = 0
-        if not is_video_mode and (bg_name := menu_data.get("background")) and plugin_storage.bg_dir:
+        if bg_name and plugin_storage.bg_dir:
             try:
                 with Image.open(plugin_storage.bg_dir / bg_name) as bg_img:
                     if bg_img.width > 0:
@@ -572,7 +614,7 @@ def _render_layout(menu_data: dict, is_video_mode: bool) -> Image.Image:
     draw_ov = ImageDraw.Draw(overlay)
 
     tf = load_font(menu_data.get("title_font", "title.ttf"), title_size)
-    sf = load_font(menu_data.get("subtitle_font") or menu_data.get("title_font", "title.ttf"), int(title_size * 0.5))
+    sf = load_font(menu_data.get("subtitle_font") or menu_data.get("title_font", "title.ttf"), subtitle_size)
     al = menu_data.get("title_align", "center")
     tx = {"left": PADDING_X, "right": final_w - PADDING_X, "center": final_w / 2}[al]
     anc = {"left": "lt", "right": "rt", "center": "mt"}[al]
@@ -640,40 +682,19 @@ def _render_layout(menu_data: dict, is_video_mode: bool) -> Image.Image:
 
         if is_text_group:
             # 纯文本分组处理
-            text_content = grp.get("text_content", "")
             text_y = by + s(20)
             text_x = bx + s(20)
             max_text_width = bx2 - text_x - s(20)
-            
-            # 获取纯文本的字体、颜色、大小 - 优先从分组属性读取，再从全局设置读取
-            text_font_name = grp.get("text_font") or menu_data.get("group_sub_font", "text.ttf")
-            text_font_size_val = grp.get("text_size")
-            if text_font_size_val:
-                text_font_size = int(text_font_size_val)
-            else:
-                text_font_size = int(menu_data.get("group_sub_size", 30))
-            
-            # 获取文本样式（粗体、斜体、下划线）
-            text_bold = grp.get("text_bold", False)
-            text_italic = grp.get("text_italic", False)
-            text_underline = grp.get("text_underline", False)
-            
-            text_font = load_font(text_font_name, s(text_font_size))
-            text_color_hex = grp.get("text_color") or menu_data.get("group_sub_color", '#AAAAAA')
-            text_color = hex_to_rgb(text_color_hex)
-            
-            # 绘制纯文本内容，支持自动换行
-            if text_content and max_text_width > 0:
-                text_content = wrap_text_to_width(text_content, text_font, max_text_width, draw_ov)
-            
-            # 获取纯文本的阴影配置
-            text_shadow = get_shadow_config(grp, menu_data, 'group_sub')
-            
+            text_font, text_content = _text_group_block(grp, menu_data, scale, max_text_width, draw_ov)
+            text_color = hex_to_rgb(grp.get("text_color") or menu_data.get("group_sub_color", '#AAAAAA'))
+            # 编辑器里纯文本分组的阴影存在 text_ 前缀下
+            text_shadow = get_shadow_config(grp, menu_data, 'text')
+
             # 获取纯文本的背景毛玻璃效果配置
             text_bg_color = grp.get("text_bg_color") or menu_data.get("group_sub_bg_color", "#333333")
             text_bg_alpha = int(grp.get("text_bg_alpha", menu_data.get("group_sub_bg_alpha", 200)))
             text_bg_blur = int(grp.get("text_bg_blur", menu_data.get("group_sub_bg_blur", 5)))
-            
+
             # 获取纯文本的对齐方式
             text_align = grp.get("text_align", "left")
 
@@ -684,7 +705,7 @@ def _render_layout(menu_data: dict, is_video_mode: bool) -> Image.Image:
                 bg_x1 = max(bx, text_x - bg_padding)
                 bg_y1 = max(by, text_y - bg_padding)
                 bg_x2 = min(bx2, text_x + max_text_width + bg_padding)
-                bg_y2 = min(by2, text_y + s(100) + bg_padding)  # 假设最大高度
+                bg_y2 = min(by2, text_y + _text_block_height(draw_ov, text_content, text_font) + bg_padding)
                 
                 # 绘制背景矩形 (毛玻璃效果)
                 bg_rgb = hex_to_rgb(text_bg_color)
@@ -761,13 +782,16 @@ def _render_layout(menu_data: dict, is_video_mode: bool) -> Image.Image:
                     iw = s(int(item_custom_w))
                     ih = s(int(item_custom_h))
                 
-                # 使用功能项自定义模糊半径或全局模糊半径
-                item_blur = get_style(item, menu_data, 'blur_radius', 'item_blur_radius', 0)
-                
+                # 使用功能项自定义模糊半径或全局模糊半径。
+                # 和分组一样要模糊的是背景图，而不是这张透明的前景层
+                item_blur = int(get_style(item, menu_data, 'blur_radius', 'item_blur_radius', 0) or 0)
+                if item_blur > 0:
+                    blur_regions.append({'box': (ix, iy, ix + iw, iy + ih), 'radius': item_blur})
+
                 draw_glass_rect(overlay, (ix, iy, ix + iw, iy + ih),
                                 get_style(item, menu_data, 'bg_color', 'item_bg_color', '#FFFFFF'),
                                 get_style(item, menu_data, 'bg_alpha', 'item_bg_alpha', 20),
-                                item_blur, corner_r=s(10))
+                                item_blur, corner_r=s(10), apply_blur=False)
                 
                 # 为每个功能项构建字体和颜色配置
                 fmap = {
@@ -784,10 +808,9 @@ def _render_layout(menu_data: dict, is_video_mode: bool) -> Image.Image:
             wx, wy = s(int(w.get("x", 0))), s(int(w.get("y", 0)))
             if w.get("type") == 'image':
                 if (c := w.get("content")) and plugin_storage.img_dir:
-                    with Image.open(plugin_storage.img_dir / c).convert("RGBA") as wi:
-                        wi = wi.resize((s(int(w.get("width", 100))), s(int(w.get("height", 100)))),
-                                       Image.Resampling.LANCZOS)
-                        overlay.paste(wi, (wx, wy), wi)
+                    wi = _open_rgba(plugin_storage.img_dir / c).resize(
+                        (s(int(w.get("width", 100))), s(int(w.get("height", 100)))), Image.Resampling.LANCZOS)
+                    overlay.paste(wi, (wx, wy), wi)
             else:
                 f = load_font(w.get("font", ""), s(int(w.get("size", 40))))
                 draw_text_with_shadow(draw_ov, (wx, wy), w.get("text", "Text"), f, hex_to_rgb(w.get("color", "#FFF")),
@@ -798,8 +821,10 @@ def _render_layout(menu_data: dict, is_video_mode: bool) -> Image.Image:
 
 
 def render_static(menu_data: dict) -> Image.Image:
-    import random
-    layout_img, blur_regions = _render_layout(menu_data, is_video_mode=False)
+    menu_data = drop_nulls(menu_data)
+    # 背景只挑一次：画布高度和实际绘制必须用同一张
+    bg_name = pick_background(menu_data)
+    layout_img, blur_regions = _render_layout(menu_data, bg_name)
     fw, fh = layout_img.size
 
     scale = float(menu_data.get("export_scale", 1.0))
@@ -811,33 +836,22 @@ def render_static(menu_data: dict) -> Image.Image:
     c_color = hex_to_rgb(menu_data.get("canvas_color", "#1e1e1e"))
     final_img = Image.new("RGBA", (fw, fh), c_color + (255,))
 
-    # 随机背景支持：优先使用 backgrounds 列表，否则使用单个 background
-    bg_name = None
-    backgrounds_list = menu_data.get("backgrounds", [])
-    if backgrounds_list:
-        bg_name = random.choice(backgrounds_list)
-    else:
-        bg_name = menu_data.get("background")
-
     if bg_name and plugin_storage.bg_dir:
         try:
-            with Image.open(plugin_storage.bg_dir / bg_name).convert("RGBA") as bg_img:
-                fit_mode = menu_data.get("bg_fit_mode", "cover")
-                align_x = menu_data.get("bg_align_x", "center")
-                align_y = menu_data.get("bg_align_y", "center")
-                bg_scale = float(menu_data.get("video_scale", 1.0))
-                custom_w = s(int(menu_data.get("bg_custom_width", 1000)))
-                custom_h = s(int(menu_data.get("bg_custom_height", 1000)))
-
-                new_w, new_h, px, py = _calculate_bg_layout(
-                    bg_img.width, bg_img.height, fw, fh,
-                    fit_mode, bg_scale, align_x, align_y,
-                    custom_w, custom_h
-                )
-                bg_rz = bg_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-                final_img.paste(bg_rz, (px, py), bg_rz)
+            bg_img = _open_rgba(plugin_storage.bg_dir / bg_name)
+            new_w, new_h, px, py = _calculate_bg_layout(
+                bg_img.width, bg_img.height, fw, fh,
+                menu_data.get("bg_fit_mode", "cover"),
+                float(menu_data.get("video_scale", 1.0)),
+                menu_data.get("bg_align_x", "center"),
+                menu_data.get("bg_align_y", "center"),
+                s(int(menu_data.get("bg_custom_width", 1000))),
+                s(int(menu_data.get("bg_custom_height", 1000))),
+            )
+            bg_rz = bg_img.resize((max(1, new_w), max(1, new_h)), Image.Resampling.LANCZOS)
+            final_img.paste(bg_rz, (px, py), bg_rz)
         except Exception as e:
-            logger.error(f"Static BG Error: {e}")
+            logger.error(f"背景图 {bg_name} 绘制失败: {e}")
 
     # 新增：在背景上应用磨砂效果
     for region in blur_regions:
@@ -870,12 +884,13 @@ def render_animated(menu_data: dict, output_path: Path) -> Optional[Path]:
             '动态背景需要额外依赖，请执行：pip install imageio imageio-ffmpeg numpy'
         ) from e
 
+    menu_data = drop_nulls(menu_data)
     writer = None
     reader = None
     write_path = output_path
 
     try:
-        foreground, _ = _render_layout(menu_data, is_video_mode=True)
+        foreground, _ = _render_layout(menu_data)
         cw, ch = foreground.size
 
         video_name = menu_data.get("bg_video")
@@ -981,7 +996,7 @@ def render_animated(menu_data: dict, output_path: Path) -> Optional[Path]:
                 else:
                     current_canvas_bg[y1:y2, x1:x2, :] = frame_resized[sy1:sy2, sx1:sx2, :]
 
-            bg_with_video_pil = Image.fromarray(current_canvas_bg, mode="RGBA")
+            bg_with_video_pil = Image.fromarray(current_canvas_bg)
             bg_with_video_pil.alpha_composite(foreground)
 
             writer.append_data(np.array(bg_with_video_pil))

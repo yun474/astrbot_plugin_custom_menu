@@ -44,7 +44,7 @@ FILE_FALLBACK_MB = 15  # 超过这个体积改用文件形式发送
 CONFIG_RECHECK_SECONDS = 30.0  # 有人手工改 menu.json 时的兜底重载间隔
 
 
-@register(PLUGIN_NAME, author="shskjw", desc="Web 可视化菜单编辑器", version="2.1.0")
+@register(PLUGIN_NAME, author="shskjw", desc="Web 可视化菜单编辑器", version="2.1.1")
 class CustomMenuPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)

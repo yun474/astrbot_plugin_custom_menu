@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>菜单编辑器 v1.9.5</title>
+    <title>菜单编辑器</title>
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
     <link rel="stylesheet" href="style.css">
 </head>
@@ -116,8 +116,8 @@
 
                     <div id="bg-custom-size-inputs" style="display:none; margin-bottom:10px; background:#222; padding:5px; border-radius:4px;">
                         <div class="form-grid-2" style="margin-bottom:0">
-                            <div><label>强制宽(px)</label><input type="number" id="bgCustomW" oninput="updateMenuMeta('bg_custom_width', this.value)"></div>
-                            <div><label>强制高(px)</label><input type="number" id="bgCustomH" oninput="updateMenuMeta('bg_custom_height', this.value)"></div>
+                            <div><label>强制宽(px)</label><input type="number" id="bgCustomW" oninput="updateMenuMeta('bg_custom_width', this.value)" placeholder="1000"></div>
+                            <div><label>强制高(px)</label><input type="number" id="bgCustomH" oninput="updateMenuMeta('bg_custom_height', this.value)" placeholder="1000"></div>
                         </div>
                     </div>
 
@@ -154,13 +154,6 @@
                 <!-- 图片专用面板 -->
                 <div id="panel-bg-image">
                     <div class="form-row">
-                        <label>背景自定义大小</label>
-                        <div class="form-grid-2">
-                            <div><label style="font-size:12px;">宽 (px)</label><input type="number" id="bgCustomW" oninput="updateMenuMeta('bg_custom_width', this.value)" placeholder="留空=自适应"></div>
-                            <div><label style="font-size:12px;">高 (px)</label><input type="number" id="bgCustomH" oninput="updateMenuMeta('bg_custom_height', this.value)" placeholder="留空=自适应"></div>
-                        </div>
-                    </div>
-                    <div class="form-row">
                         <label>选择背景图片</label>
                         <div style="display:flex; gap:5px; align-items:center;">
                             <div id="bgSelectPreview" style="flex:1;"></div>
@@ -171,6 +164,7 @@
                     <!-- 随机背景功能 -->
                     <div style="background:#2b2b2b; padding:10px; border-radius:4px; margin-top:10px; border:1px solid #444;">
                         <label style="color:#888;font-size:11px;margin-bottom:8px;display:block;">🎲 随机背景 (每次触发随机选择)</label>
+                        <div id="randomBgHint" class="hint-warn" style="display:none;">已配置随机背景：出图时只从下面的列表里挑，上面的单张背景不生效；画布预览第一张。</div>
                         <div id="randomBgList" style="max-height:150px; overflow-y:auto; margin-bottom:8px;"></div>
                         <button class="btn btn-secondary btn-block" onclick="openRandomBgModal()">✏️ 编辑随机背景列表</button>
                     </div>
@@ -351,7 +345,7 @@
     </div>
 </div>
 
-<!-- 通用图片选择器弹窗 -->
+<!-- 真实预览弹窗 -->
 <div id="realPreviewModal" class="modal-overlay" onclick="if (event.target === this) closeRealPreview()">
     <div class="modal" style="width: 760px; max-width: 92vw;">
         <h3>👁 真实预览 <span style="font-size:12px;color:#888;font-weight:normal;">和发到群里的图是同一套渲染</span></h3>
@@ -365,6 +359,7 @@
     </div>
 </div>
 
+<!-- 通用图片选择器弹窗 -->
 <div id="imagePickerModal" class="modal-overlay">
     <div class="modal" style="width: 600px;">
         <h3 id="imagePickerTitle">选择图片</h3>
@@ -378,6 +373,19 @@
         </div>
     </div>
 </div>
+
+<!-- 确认框：插件页 iframe 没有 allow-modals，原生 confirm 用不了 -->
+<div id="confirmModal" class="modal-overlay confirm-overlay">
+    <div class="modal" style="width: 420px;">
+        <h3>请确认</h3>
+        <div id="confirmText" class="confirm-text"></div>
+        <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:20px;">
+            <button class="btn btn-secondary" id="confirmCancel">取消</button>
+            <button class="btn btn-danger" id="confirmOk">确定</button>
+        </div>
+    </div>
+</div>
+<div id="toastBox" class="toast-box"></div>
 
 <script src="editor.js"></script>
 </body>
